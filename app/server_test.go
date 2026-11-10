@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"testing"
@@ -183,24 +185,102 @@ func TestSendCorrelationID(t *testing.T) {
 	expectNoMoreData(t, conn)
 }
 
-// Stage nv3: the request isn't parsed, so even the placeholder request from
-// the stage instructions (`echo -n "Placeholder request" | nc localhost 9092`)
-// gets the 8-byte response, after which the broker closes the connection.
-func TestSendCorrelationIDForPlaceholderRequest(t *testing.T) {
+// Stage wa6: the broker echoes back the correlation ID found in the request
+// header (v2).
+func TestParseCorrelationID(t *testing.T) {
+	t.Run("example from the stage instructions", func(t *testing.T) {
+		addr := startTestServer(t)
+		conn := dial(t, addr)
+
+		send(t, conn, mustDecodeHex(t, exampleRequestHex))
+
+		_, payload := readResponse(t, conn)
+		if want := []byte{0x6f, 0x7f, 0xc6, 0x61}; !bytes.Equal(payload, want) {
+			t.Errorf("response header = % x, want % x (correlation_id 1870644833)", payload, want)
+		}
+
+		expectNoMoreData(t, conn)
+	})
+
+	correlationIDs := []int32{0, 1, 7, 311908132, 1870644833, math.MaxInt32, -1, math.MinInt32}
+
+	for _, correlationID := range correlationIDs {
+		t.Run(fmt.Sprintf("correlation ID %d", correlationID), func(t *testing.T) {
+			addr := startTestServer(t)
+			conn := dial(t, addr)
+
+			send(t, conn, apiVersionsRequest(correlationID))
+
+			messageSize, payload := readResponse(t, conn)
+			if len(payload) != 4 {
+				t.Fatalf("expected a 4-byte response header, got %d bytes: % x", len(payload), payload)
+			}
+			if total := 4 + int(messageSize); total != 8 {
+				t.Errorf("expected the response to be 8 bytes long, got %d", total)
+			}
+			if got := int32(binary.BigEndian.Uint32(payload)); got != correlationID {
+				t.Errorf("correlation_id = %d, want %d", got, correlationID)
+			}
+
+			expectNoMoreData(t, conn)
+		})
+	}
+}
+
+// TCP is a byte stream: a request may arrive in several pieces, and the broker
+// must wait for all of it before answering.
+func TestRequestSplitAcrossWrites(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
 
-	send(t, conn, []byte("Placeholder request"))
+	request := apiVersionsRequest(1234567890)
 
-	response, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("failed to read response: %v", err)
+	// Cut inside message_size, inside the correlation ID and inside the body.
+	for _, piece := range [][]byte{request[:2], request[2:10], request[10:20], request[20:]} {
+		send(t, conn, piece)
+		time.Sleep(20 * time.Millisecond)
 	}
-	if len(response) != 8 {
-		t.Fatalf("expected an 8-byte response, got %d bytes: % x", len(response), response)
+
+	_, payload := readResponse(t, conn)
+	if len(payload) != 4 {
+		t.Fatalf("expected a 4-byte response header, got %d bytes: % x", len(payload), payload)
 	}
-	if got := int32(binary.BigEndian.Uint32(response[4:])); got != 7 {
-		t.Errorf("correlation_id = %d, want 7", got)
+	if got := int32(binary.BigEndian.Uint32(payload)); got != 1234567890 {
+		t.Errorf("correlation_id = %d, want 1234567890", got)
+	}
+}
+
+// A request that can't be parsed gets no response: the broker just closes the
+// connection, like Kafka does.
+func TestMalformedRequestClosesConnection(t *testing.T) {
+	tests := []struct {
+		name    string
+		request string
+	}{
+		{name: "header shorter than a request header v2", request: "00000004 00120004"},
+		{name: "client_id longer than the message", request: "0000000c 0012 0004 00000007 0064 6b61"},
+		{name: "negative message_size", request: "ffffffff 0012 0004 00000007 ffff 00"},
+		{name: "oversized message_size", request: "7fffffff 0012 0004 00000007 ffff 00"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr := startTestServer(t)
+			conn := dial(t, addr)
+
+			send(t, conn, mustDecodeHex(t, tt.request))
+
+			// The connection must be closed without a single byte being sent.
+			// Depending on timing that shows up as EOF or as a reset.
+			response := make([]byte, 64)
+			n, err := conn.Read(response)
+			if n > 0 {
+				t.Fatalf("expected no response, got % x", response[:n])
+			}
+			if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("expected the connection to be closed, got error: %v", err)
+			}
+		})
 	}
 }
 
