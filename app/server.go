@@ -54,6 +54,11 @@ func (b *broker) handleConnection(conn net.Conn) {
 			return
 		}
 
+		// Some requests are not answered: see handleProduce.
+		if response == nil {
+			continue
+		}
+
 		if _, err := conn.Write(response); err != nil {
 			fmt.Println("Error writing response: ", err.Error())
 			return
@@ -62,7 +67,8 @@ func (b *broker) handleConnection(conn net.Conn) {
 }
 
 // handleRequest builds the response message for a request message (the header
-// and body of a request, without the message_size that precedes them).
+// and body of a request, without the message_size that precedes them). The
+// response is nil for a request that must not be answered.
 func (b *broker) handleRequest(message []byte) ([]byte, error) {
 	d := newDecoder(message)
 
@@ -84,6 +90,8 @@ func (b *broker) handleRequest(message []byte) ([]byte, error) {
 
 	var body []byte
 	switch header.apiKey {
+	case apiKeyProduce:
+		body, err = b.handleProduce(d)
 	case apiKeyFetch:
 		body, err = b.handleFetch(d)
 	case apiKeyDescribeTopicPartitions:
@@ -91,7 +99,7 @@ func (b *broker) handleRequest(message []byte) ([]byte, error) {
 	default:
 		err = fmt.Errorf("unsupported request: API key %d", header.apiKey)
 	}
-	if err != nil {
+	if err != nil || body == nil {
 		return nil, err
 	}
 

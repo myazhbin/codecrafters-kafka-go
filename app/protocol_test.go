@@ -490,6 +490,79 @@ func TestCompactString(t *testing.T) {
 	}
 }
 
+func TestDecoderCompactNullableString(t *testing.T) {
+	tests := []struct {
+		input string
+		want  *string // nil for null
+	}{
+		{input: "00", want: nil},
+		{input: "01", want: new(string)},
+		{input: "04 666f6f", want: func() *string { s := "foo"; return &s }()},
+	}
+
+	for _, tt := range tests {
+		d := newDecoder(mustDecodeHex(t, tt.input))
+
+		got := d.compactNullableString()
+		if d.err != nil || len(d.buf) != 0 {
+			t.Errorf("compactNullableString() of %s: err = %v, %d bytes left", tt.input, d.err, len(d.buf))
+		}
+		if (got == nil) != (tt.want == nil) || (got != nil && *got != *tt.want) {
+			t.Errorf("compactNullableString() of %s = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+
+	for _, input := range []string{"", "04 666f", "80"} {
+		d := newDecoder(mustDecodeHex(t, input))
+
+		if got := d.compactNullableString(); got != nil || d.err == nil {
+			t.Errorf("compactNullableString() of %q = %v (err: %v), want an error", input, got, d.err)
+		}
+	}
+}
+
+func TestDecoderCompactBytes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []byte // nil for null
+	}{
+		{input: "00", want: nil},
+		{input: "01", want: []byte{}},
+		{input: "04 aabbcc", want: []byte{0xaa, 0xbb, 0xcc}},
+		{input: "c901" + strings.Repeat("ee", 200), want: bytes.Repeat([]byte{0xee}, 200)},
+	}
+
+	for _, tt := range tests {
+		d := newDecoder(mustDecodeHex(t, tt.input))
+
+		got := d.compactBytes()
+		if d.err != nil || len(d.buf) != 0 {
+			t.Errorf("compactBytes() of %.12s: err = %v, %d bytes left", tt.input, d.err, len(d.buf))
+		}
+		if (got == nil) != (tt.want == nil) || !bytes.Equal(got, tt.want) {
+			t.Errorf("compactBytes() of %.12s = % x, want % x", tt.input, got, tt.want)
+		}
+
+		// The encoder must write what the decoder reads (null aside, which
+		// the broker never has to write).
+		if tt.want != nil {
+			var e encoder
+			e.compactBytes(tt.want)
+			if !bytes.Equal(e.buf, mustDecodeHex(t, tt.input)) {
+				t.Errorf("compactBytes(% x) is encoded as % x, want %s", tt.want, e.buf, tt.input)
+			}
+		}
+	}
+
+	for _, input := range []string{"", "04 aabb", "80"} {
+		d := newDecoder(mustDecodeHex(t, input))
+
+		if got := d.compactBytes(); got != nil || d.err == nil {
+			t.Errorf("compactBytes() of %q = % x (err: %v), want an error", input, got, d.err)
+		}
+	}
+}
+
 func TestDecoderCompactArrayLength(t *testing.T) {
 	tests := []struct {
 		input string

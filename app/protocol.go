@@ -235,24 +235,47 @@ func (d *decoder) nullableString() *string {
 	return &s
 }
 
-// compactString decodes a COMPACT_STRING: the length of the string + 1 as an
-// UNSIGNED_VARINT, followed by the bytes of the string. A length of 0 stands
-// for null, which a COMPACT_STRING must not be.
-func (d *decoder) compactString() string {
+// compactNullableString decodes a COMPACT_NULLABLE_STRING: the length of the
+// string + 1 as an UNSIGNED_VARINT, followed by the bytes of the string. A
+// length of 0 stands for null, which is returned as nil.
+func (d *decoder) compactNullableString() *string {
 	n := d.uvarint()
-	if d.err != nil {
-		return ""
-	}
-	if n == 0 {
-		d.err = errors.New("non-nullable string is null")
-		return ""
+	if d.err != nil || n == 0 {
+		return nil
 	}
 
 	b := d.bytes(int(n - 1))
 	if d.err != nil {
+		return nil
+	}
+	s := string(b)
+	return &s
+}
+
+// compactString decodes a COMPACT_STRING, which is encoded like a
+// COMPACT_NULLABLE_STRING but must not be null.
+func (d *decoder) compactString() string {
+	s := d.compactNullableString()
+	if d.err != nil {
 		return ""
 	}
-	return string(b)
+	if s == nil {
+		d.err = errors.New("non-nullable string is null")
+		return ""
+	}
+	return *s
+}
+
+// compactBytes decodes COMPACT_BYTES: the number of bytes + 1 as an
+// UNSIGNED_VARINT, followed by the bytes. A length of 0 stands for null, which
+// is returned as nil. COMPACT_RECORDS, which hold record batches, are encoded
+// the same way.
+func (d *decoder) compactBytes() []byte {
+	n := d.uvarint()
+	if d.err != nil || n == 0 {
+		return nil
+	}
+	return d.bytes(int(n - 1))
 }
 
 // compactArrayLength decodes the length of a COMPACT_ARRAY and returns the
