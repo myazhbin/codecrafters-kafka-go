@@ -19,29 +19,33 @@ func serve(l net.Listener) error {
 	}
 }
 
-// handleConnection reads a request from conn and answers it.
+// handleConnection answers the requests that a client sends over conn, one
+// after the other, until the client disconnects.
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	message, err := readMessage(conn)
-	if err != nil {
-		// A client that disconnects without sending anything is not an error.
-		if !errors.Is(err, io.EOF) {
-			fmt.Println("Error reading request: ", err.Error())
+	for {
+		message, err := readMessage(conn)
+		if err != nil {
+			// A client that disconnects between two requests is not an error.
+			if !errors.Is(err, io.EOF) {
+				fmt.Println("Error reading request: ", err.Error())
+			}
+			return
 		}
-		return
-	}
 
-	header, err := decodeRequestHeader(newDecoder(message))
-	if err != nil {
-		fmt.Println("Error parsing request header: ", err.Error())
-		return
-	}
+		header, err := decodeRequestHeader(newDecoder(message))
+		if err != nil {
+			fmt.Println("Error parsing request header: ", err.Error())
+			return
+		}
 
-	// Every request is treated as an ApiVersions request for now.
-	body := handleApiVersions(header)
+		// Every request is treated as an ApiVersions request for now.
+		body := handleApiVersions(header)
 
-	if _, err := conn.Write(encodeResponse(header.correlationID, body)); err != nil {
-		fmt.Println("Error writing response: ", err.Error())
+		if _, err := conn.Write(encodeResponse(header.correlationID, body)); err != nil {
+			fmt.Println("Error writing response: ", err.Error())
+			return
+		}
 	}
 }

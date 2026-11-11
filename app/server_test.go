@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -139,6 +140,124 @@ func TestServeAcceptsConsecutiveClients(t *testing.T) {
 
 		if got := readResponse(t, conn).correlationID; got != 100+i {
 			t.Errorf("client %d: correlation_id = %d, want %d", i, got, 100+i)
+		}
+
+		conn.Close()
+	}
+}
+
+// expectApiVersionsResponse reads one response from conn and checks it the way
+// the CodeCrafters tester checks the response to a valid ApiVersions request.
+func expectApiVersionsResponse(t *testing.T, conn net.Conn, correlationID int32) {
+	t.Helper()
+
+	response := readResponse(t, conn)
+
+	// The message length is valid.
+	if want := int32(4 + len(response.body)); response.messageSize != want {
+		t.Errorf("message_size = %d, want %d", response.messageSize, want)
+	}
+
+	// The correlation ID matches the one in the request header.
+	if response.correlationID != correlationID {
+		t.Errorf("correlation_id = %d, want %d", response.correlationID, correlationID)
+	}
+
+	// The error code is 0 (No Error), and no bytes remain after the body
+	// (checked by decodeApiVersionsResponse).
+	body := decodeApiVersionsResponse(t, response.body)
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+
+	// The body has an entry for the API key 18 (ApiVersions) whose
+	// MaxVersion is at least 4.
+	if api := findAPI(t, body.apiKeys, 18); api.maxVersion < 4 {
+		t.Errorf("max_version for ApiVersions = %d, want at least 4", api.maxVersion)
+	}
+}
+
+// Stage nh4: the broker answers several requests sent one after the other over
+// the same connection.
+func TestSerialRequests(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	for _, correlationID := range []int32{1001, 7, 1870644833, -5, 1002} {
+		send(t, conn, apiVersionsRequest(correlationID))
+		expectApiVersionsResponse(t, conn, correlationID)
+	}
+
+	expectNoMoreData(t, conn)
+}
+
+// The broker waits for the next request for as long as the client keeps the
+// connection open.
+func TestSerialRequestsWithPauses(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	for correlationID := int32(1); correlationID <= 3; correlationID++ {
+		send(t, conn, apiVersionsRequest(correlationID))
+		expectApiVersionsResponse(t, conn, correlationID)
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Requests may be sent without waiting for the previous response: the broker
+// must answer all of them, in the order they were sent.
+func TestPipelinedRequests(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	correlationIDs := []int32{11, 22, 33, 44}
+
+	var requests []byte
+	for _, correlationID := range correlationIDs {
+		requests = append(requests, apiVersionsRequest(correlationID)...)
+	}
+	send(t, conn, requests)
+
+	for _, correlationID := range correlationIDs {
+		expectApiVersionsResponse(t, conn, correlationID)
+	}
+
+	expectNoMoreData(t, conn)
+}
+
+// A request for an unsupported version gets an error response, after which
+// the connection can still be used.
+func TestSerialRequestsAfterUnsupportedVersion(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	send(t, conn, apiVersionsRequestWithVersion(99, 1))
+
+	response := readResponse(t, conn)
+	if response.correlationID != 1 {
+		t.Errorf("correlation_id = %d, want 1", response.correlationID)
+	}
+	if got := decodeApiVersionsResponse(t, response.body).errorCode; got != 35 {
+		t.Errorf("error_code = %d, want 35", got)
+	}
+
+	send(t, conn, apiVersionsRequest(2))
+	expectApiVersionsResponse(t, conn, 2)
+}
+
+// Once a client has disconnected, the broker serves the next one.
+func TestServeAcceptsClientAfterSerialRequests(t *testing.T) {
+	addr := startTestServer(t)
+
+	for client := int32(0); client < 3; client++ {
+		conn := dial(t, addr)
+
+		for request := int32(0); request < 3; request++ {
+			correlationID := client*10 + request
+
+			send(t, conn, apiVersionsRequest(correlationID))
+			expectApiVersionsResponse(t, conn, correlationID)
 		}
 
 		conn.Close()
