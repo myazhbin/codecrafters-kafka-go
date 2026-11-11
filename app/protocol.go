@@ -196,3 +196,19 @@ func (e *encoder) int16(v int16) {
 func (e *encoder) int32(v int32) {
 	e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
 }
+
+// uvarint encodes an UNSIGNED_VARINT.
+func (e *encoder) uvarint(v uint32) {
+	e.buf = binary.AppendUvarint(e.buf, uint64(v))
+}
+
+// compactArrayLength encodes the length of a COMPACT_ARRAY of n elements. It
+// is stored as n + 1, because 0 stands for a null array.
+func (e *encoder) compactArrayLength(n int) {
+	e.uvarint(uint32(n + 1))
+}
+
+// emptyTaggedFields encodes a TAG_BUFFER that holds no tagged fields.
+func (e *encoder) emptyTaggedFields() {
+	e.uvarint(0)
+}

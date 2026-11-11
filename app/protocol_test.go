@@ -361,3 +361,63 @@ func TestEncoderIntegers(t *testing.T) {
 		t.Errorf("encoded = % x, want % x", e.buf, want)
 	}
 }
+
+func TestEncoderUvarint(t *testing.T) {
+	tests := []struct {
+		value uint32
+		want  string
+	}{
+		{value: 0, want: "00"},
+		{value: 1, want: "01"},
+		{value: 127, want: "7f"},
+		{value: 128, want: "8001"},
+		{value: 300, want: "ac02"},
+		{value: 4294967295, want: "ffffffff0f"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			var e encoder
+			e.uvarint(tt.value)
+
+			if want := mustDecodeHex(t, tt.want); !bytes.Equal(e.buf, want) {
+				t.Errorf("uvarint(%d) = % x, want % x", tt.value, e.buf, want)
+			}
+
+			// The decoder must read back what the encoder wrote.
+			if got := newDecoder(e.buf).uvarint(); got != tt.value {
+				t.Errorf("decoded %d, want %d", got, tt.value)
+			}
+		})
+	}
+}
+
+func TestEncoderCompactArrayLength(t *testing.T) {
+	tests := []struct {
+		elements int
+		want     string
+	}{
+		{elements: 0, want: "01"},
+		{elements: 1, want: "02"},
+		{elements: 126, want: "7f"},
+		{elements: 127, want: "8001"},
+	}
+
+	for _, tt := range tests {
+		var e encoder
+		e.compactArrayLength(tt.elements)
+
+		if want := mustDecodeHex(t, tt.want); !bytes.Equal(e.buf, want) {
+			t.Errorf("compactArrayLength(%d) = % x, want % x", tt.elements, e.buf, want)
+		}
+	}
+}
+
+func TestEncoderEmptyTaggedFields(t *testing.T) {
+	var e encoder
+	e.emptyTaggedFields()
+
+	if !bytes.Equal(e.buf, []byte{0x00}) {
+		t.Errorf("emptyTaggedFields() = % x, want 00", e.buf)
+	}
+}

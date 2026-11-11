@@ -1,29 +1,69 @@
 package main
 
+// API keys of the Kafka protocol.
+const (
+	apiKeyApiVersions int16 = 18
+)
+
 // Error codes of the Kafka protocol.
 const (
 	errorCodeNone               int16 = 0
 	errorCodeUnsupportedVersion int16 = 35
 )
 
-// The versions of the ApiVersions API that the broker supports.
-const (
-	apiVersionsMinVersion int16 = 0
-	apiVersionsMaxVersion int16 = 4
-)
+// apiVersionRange is the range of versions of an API that the broker supports.
+type apiVersionRange struct {
+	apiKey     int16
+	minVersion int16
+	maxVersion int16
+}
 
-// handleApiVersions builds the body of the response to an ApiVersions request.
+// supportedAPIs lists the APIs that the broker supports. It is what the broker
+// advertises in its ApiVersions responses.
+var supportedAPIs = []apiVersionRange{
+	{apiKey: apiKeyApiVersions, minVersion: 0, maxVersion: 4},
+}
+
+// supportsVersion reports whether the broker supports the given version of an
+// API.
+func supportsVersion(apiKey, apiVersion int16) bool {
+	for _, api := range supportedAPIs {
+		if api.apiKey == apiKey {
+			return api.minVersion <= apiVersion && apiVersion <= api.maxVersion
+		}
+	}
+	return false
+}
+
+// handleApiVersions builds the body of the response to an ApiVersions request,
+// which tells the client the APIs and versions that the broker supports.
 //
-// The body starts with an error code, which is UNSUPPORTED_VERSION when the
-// client asked for a version of ApiVersions that the broker doesn't support.
+// The error code is UNSUPPORTED_VERSION when the client asked for a version of
+// ApiVersions that the broker doesn't support.
 func handleApiVersions(header requestHeader) []byte {
 	errorCode := errorCodeNone
-	if header.apiVersion < apiVersionsMinVersion || header.apiVersion > apiVersionsMaxVersion {
+	if !supportsVersion(apiKeyApiVersions, header.apiVersion) {
 		errorCode = errorCodeUnsupportedVersion
 	}
 
+	return encodeApiVersionsResponse(errorCode, supportedAPIs)
+}
+
+// encodeApiVersionsResponse encodes the body of an ApiVersions response v4.
+func encodeApiVersionsResponse(errorCode int16, apis []apiVersionRange) []byte {
 	var e encoder
 	e.int16(errorCode)
+
+	e.compactArrayLength(len(apis)) // api_keys
+	for _, api := range apis {
+		e.int16(api.apiKey)
+		e.int16(api.minVersion)
+		e.int16(api.maxVersion)
+		e.emptyTaggedFields()
+	}
+
+	e.int32(0) // throttle_time_ms
+	e.emptyTaggedFields()
 
 	return e.buf
 }
