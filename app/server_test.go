@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -262,4 +263,107 @@ func TestServeAcceptsClientAfterSerialRequests(t *testing.T) {
 
 		conn.Close()
 	}
+}
+
+// Stage sk0: several clients are connected at the same time, and each of them
+// sends multiple requests. The requests of the clients are interleaved, so a
+// broker that serves one client at a time can't answer them.
+func TestConcurrentClients(t *testing.T) {
+	addr := startTestServer(t)
+
+	conns := []net.Conn{dial(t, addr), dial(t, addr), dial(t, addr)}
+
+	for round := int32(0); round < 3; round++ {
+		for client, conn := range conns {
+			correlationID := int32(client)*100 + round
+
+			send(t, conn, apiVersionsRequest(correlationID))
+			expectApiVersionsResponse(t, conn, correlationID)
+		}
+	}
+
+	// The clients are also served when they take turns in the reverse order.
+	for client := len(conns) - 1; client >= 0; client-- {
+		correlationID := int32(client)*100 + 99
+
+		send(t, conns[client], apiVersionsRequest(correlationID))
+		expectApiVersionsResponse(t, conns[client], correlationID)
+	}
+}
+
+// All the responses to requests that were sent before any response was read
+// arrive on the connection that the request was sent on.
+func TestConcurrentClientsReadAfterAllRequestsAreSent(t *testing.T) {
+	addr := startTestServer(t)
+
+	conns := []net.Conn{dial(t, addr), dial(t, addr), dial(t, addr)}
+
+	for client, conn := range conns {
+		send(t, conn, apiVersionsRequest(int32(client)+1))
+	}
+	for client, conn := range conns {
+		expectApiVersionsResponse(t, conn, int32(client)+1)
+		expectNoMoreData(t, conn)
+	}
+}
+
+// A client that is connected but silent doesn't keep others from being served.
+func TestIdleClientDoesNotBlockOthers(t *testing.T) {
+	addr := startTestServer(t)
+
+	idle := dial(t, addr)
+
+	active := dial(t, addr)
+	send(t, active, apiVersionsRequest(1))
+	expectApiVersionsResponse(t, active, 1)
+
+	// The idle client is still connected and gets served once it speaks up.
+	send(t, idle, apiVersionsRequest(2))
+	expectApiVersionsResponse(t, idle, 2)
+}
+
+// Many clients send requests at the very same time. Run with -race, this also
+// checks that serving them concurrently is free of data races.
+func TestConcurrentClientsInParallel(t *testing.T) {
+	const (
+		clients           = 10
+		requestsPerClient = 20
+	)
+
+	addr := startTestServer(t)
+
+	// Clients only start sending once all of them are connected.
+	var connected sync.WaitGroup
+	connected.Add(clients)
+	allConnected := make(chan struct{})
+	go func() {
+		connected.Wait()
+		close(allConnected)
+	}()
+
+	// The group only returns once all its parallel subtests are done, which
+	// keeps the broker running until then.
+	t.Run("group", func(t *testing.T) {
+		for client := int32(0); client < clients; client++ {
+			t.Run(fmt.Sprintf("client %d", client), func(t *testing.T) {
+				t.Parallel()
+
+				conn := dial(t, addr)
+				connected.Done()
+
+				select {
+				case <-allConnected:
+				case <-time.After(testTimeout):
+					t.Fatal("timed out waiting for the other clients to connect")
+				}
+
+				for request := int32(0); request < requestsPerClient; request++ {
+					correlationID := client*1000 + request
+
+					send(t, conn, apiVersionsRequest(correlationID))
+					expectApiVersionsResponse(t, conn, correlationID)
+				}
+			})
+		}
+	})
 }

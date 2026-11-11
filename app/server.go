@@ -7,15 +7,16 @@ import (
 	"net"
 )
 
-// serve accepts connections on l and handles them until the listener fails or
-// is closed.
+// serve accepts connections on l until the listener fails or is closed. Every
+// client is served by its own goroutine, so clients don't have to wait for
+// each other.
 func serve(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			return err
 		}
-		handleConnection(conn)
+		go handleConnection(conn)
 	}
 }
 
