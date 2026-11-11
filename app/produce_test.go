@@ -628,6 +628,82 @@ func TestProduceSingleRecord(t *testing.T) {
 	}
 }
 
+// Stage yd8: a record batch with several records is stored as a single unit
+// in the log file of its partition. Its records get sequential offsets,
+// starting at the base offset of the batch.
+func TestProduceMultipleRecords(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "bar", id: testTopicID(1), partitions: []int32{0}},
+		testTopic{name: "foo", id: testTopicID(2), partitions: []int32{0}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	messages := []string{"Hello Earth!", "Hello World!", "Hello Kafka!"}
+	batch := helloBatch(messages...)
+
+	body := produce(t, addr, produceTopic{
+		name:       "foo",
+		partitions: []producePartition{{index: 0, records: batch}},
+	})
+
+	// The error_code is 0, the base_offset is 0 (the base offset for the
+	// batch), the log_append_time_ms is -1 and the log_start_offset is 0.
+	expectProduced(t, body, "foo", 0, 0)
+
+	// The record batch sent in the request is written to the log file.
+	log := readLogSegment(t, logDir, "foo", 0)
+	if !bytes.Equal(log, batch) {
+		t.Errorf("log file = % x, want the record batch of the request: % x", log, batch)
+	}
+
+	// The log holds one batch, whose records have the offsets 0, 1 and 2.
+	batches := mustDecodeBatches(t, log)
+	if len(batches) != 1 {
+		t.Fatalf("the log file holds %d batches, want 1", len(batches))
+	}
+	if batches[0].baseOffset != 0 || batches[0].lastOffset() != 2 {
+		t.Errorf("the batch has the offsets %d-%d, want 0-2", batches[0].baseOffset, batches[0].lastOffset())
+	}
+	records := mustDecodeRecords(t, batches[0])
+	if len(records) != len(messages) {
+		t.Fatalf("the batch holds %d records, want %d", len(records), len(messages))
+	}
+	for i, message := range messages {
+		if records[i].offsetDelta != int32(i) || string(records[i].value) != message {
+			t.Errorf("record %d = {offset delta: %d, value: %q}, want {%d, %q}",
+				i, records[i].offsetDelta, records[i].value, i, message)
+		}
+	}
+
+	// A consumer gets the three records back, and sees that the partition
+	// ends at the offset 3.
+	fetched := fetch(t, addr, fetchTopic{topicID: testTopicID(2), partitions: []fetchPartition{{index: 0}}})
+	if len(fetched.topics) != 1 || len(fetched.topics[0].partitions) != 1 {
+		t.Fatalf("unexpected Fetch response: %+v", fetched)
+	}
+	partition := fetched.topics[0].partitions[0]
+	if partition.errorCode != 0 || partition.highWatermark != 3 {
+		t.Errorf("fetched partition: error_code = %d, high_watermark = %d; want 0, 3", partition.errorCode, partition.highWatermark)
+	}
+	if got, want := fetchedValues(t, partition), [][]string{messages}; !reflect.DeepEqual(got, want) {
+		t.Errorf("fetched messages = %q, want %q", got, want)
+	}
+
+	// The next batch starts after the last record of this one: every record
+	// took an offset.
+	body = produce(t, addr, produceTopic{
+		name:       "foo",
+		partitions: []producePartition{{index: 0, records: helloBatch("Hello again!", "And again!")}},
+	})
+	expectProduced(t, body, "foo", 0, 3)
+
+	batches = mustDecodeBatches(t, readLogSegment(t, logDir, "foo", 0))
+	if len(batches) != 2 || batches[1].baseOffset != 3 || batches[1].lastOffset() != 4 {
+		t.Errorf("unexpected batches in the log file after the second request: %+v", batches)
+	}
+}
+
 // listDir returns the names of the entries of a directory, sorted.
 func listDir(t *testing.T, dir string) []string {
 	t.Helper()
