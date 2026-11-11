@@ -49,3 +49,19 @@ func readLog(dir string) ([]byte, error) {
 
 	return log, nil
 }
+
+// readRecordBatches reads the log stored in dir and returns its contents along
+// with the record batches that it consists of.
+func readRecordBatches(dir string) ([]byte, []recordBatch, error) {
+	log, err := readLog(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	batches, err := decodeRecordBatches(log)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return log, batches, nil
+}

@@ -19,24 +19,58 @@ const (
 )
 
 // recordBatch is a batch of records, the unit in which Kafka stores records in
-// the segment files of a log.
+// the segment files of a log and sends them over the network.
 type recordBatch struct {
-	baseOffset           int64
+	baseOffset           int64 // the offset of the first record of the batch
 	partitionLeaderEpoch int32
 	crc                  uint32
 	attributes           int16
-	lastOffsetDelta      int32
+	lastOffsetDelta      int32 // the offset of the last record, relative to baseOffset
 	baseTimestamp        int64
 	maxTimestamp         int64
 	producerID           int64
 	producerEpoch        int16
 	baseSequence         int32
-	records              []record
+	recordCount          int32
+
+	// recordData holds the records of the batch as they are stored, which may
+	// be compressed: see records.
+	recordData []byte
+
+	// raw is the batch as it is stored: all of the above, encoded.
+	raw []byte
 }
 
 // isControl reports whether the batch is a control batch.
 func (b recordBatch) isControl() bool {
 	return b.attributes&batchControlFlag != 0
+}
+
+// lastOffset returns the offset of the last record of the batch.
+func (b recordBatch) lastOffset() int64 {
+	return b.baseOffset + int64(b.lastOffsetDelta)
+}
+
+// records decodes the records of the batch.
+func (b recordBatch) records() ([]record, error) {
+	if b.attributes&batchCompressionMask != 0 {
+		return nil, errors.New("compressed record batches are not supported")
+	}
+
+	var records []record
+
+	d := newDecoder(b.recordData)
+	for i := int32(0); i < b.recordCount && d.err == nil; i++ {
+		records = append(records, decodeRecord(d))
+	}
+	if d.err != nil {
+		return nil, d.err
+	}
+	if len(d.buf) != 0 {
+		return nil, fmt.Errorf("%d bytes left after the %d records of the batch", len(d.buf), b.recordCount)
+	}
+
+	return records, nil
 }
 
 // record is a single record of a record batch.
@@ -55,12 +89,13 @@ type recordHeader struct {
 	value []byte // nil when the header has no value
 }
 
-// decodeRecordBatches decodes the contents of a log segment file, which is a
-// sequence of record batches.
-func decodeRecordBatches(data []byte) ([]recordBatch, error) {
+// decodeRecordBatches decodes the contents of a log, which is a sequence of
+// record batches. The records of the batches are left as they are: they can be
+// decoded with recordBatch.records.
+func decodeRecordBatches(log []byte) ([]recordBatch, error) {
 	var batches []recordBatch
 
-	d := newDecoder(data)
+	d := newDecoder(log)
 	for len(d.buf) > 0 {
 		batch := decodeRecordBatch(d)
 		if d.err != nil {
@@ -72,10 +107,12 @@ func decodeRecordBatches(data []byte) ([]recordBatch, error) {
 	return batches, nil
 }
 
-// decodeRecordBatch decodes a record batch. Its CRC is not verified.
+// decodeRecordBatch decodes a record batch, except for its records. The CRC of
+// the batch is not verified.
 func decodeRecordBatch(d *decoder) recordBatch {
-	var batch recordBatch
+	encoded := d.buf
 
+	var batch recordBatch
 	batch.baseOffset = d.int64()
 
 	// The batch length counts the bytes of the batch that follow it.
@@ -93,16 +130,11 @@ func decodeRecordBatch(d *decoder) recordBatch {
 	batch.producerID = b.int64()
 	batch.producerEpoch = b.int16()
 	batch.baseSequence = b.int32()
-
-	recordCount := b.int32()
-	if b.err == nil && batch.attributes&batchCompressionMask != 0 {
-		b.err = errors.New("compressed record batches are not supported")
-	}
-	for i := int32(0); i < recordCount && b.err == nil; i++ {
-		batch.records = append(batch.records, decodeRecord(b))
-	}
+	batch.recordCount = b.int32()
+	batch.recordData = b.buf
 
 	d.fail(b.err)
+	batch.raw = encoded[:len(encoded)-len(d.buf)]
 	return batch
 }
 

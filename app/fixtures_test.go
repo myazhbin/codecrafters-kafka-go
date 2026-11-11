@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -274,7 +275,9 @@ func clusterMetadataLog(topics ...testTopic) []byte {
 func writeLogSegment(t *testing.T, logDir, topic string, partition int32, data []byte) {
 	t.Helper()
 
-	writeFile(t, filepath.Join(partitionDir(logDir, topic, partition), "00000000000000000000.log"), data)
+	// Kafka keeps the log of a partition in the directory <topic>-<partition>.
+	dir := filepath.Join(logDir, fmt.Sprintf("%s-%d", topic, partition))
+	writeFile(t, filepath.Join(dir, "00000000000000000000.log"), data)
 }
 
 // writeClusterMetadataLog writes a cluster metadata log that describes topics

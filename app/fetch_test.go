@@ -392,6 +392,31 @@ func TestEncodeFetchResponse(t *testing.T) {
 				"00", // tag buffer
 		},
 		{
+			name: "partition with records",
+			topics: []fetchTopicResponse{{
+				topicID: sazTopicID,
+				partitions: []fetchPartitionResponse{{
+					index:          2,
+					highWatermark:  7,
+					logStartOffset: 3,
+					records:        []byte{0xde, 0xad, 0xbe, 0xef},
+				}},
+			}},
+			want: "00000000 0000 00000000" +
+				"02" + // responses: 1 element
+				"00000000000040008000000000000091" + // topic_id
+				"02" + // partitions: 1 element
+				"00000002" + // partition_index: 2
+				"0000" + // error_code: 0
+				"0000000000000007" + // high_watermark: 7
+				"0000000000000007" + // last_stable_offset: 7
+				"0000000000000003" + // log_start_offset: 3
+				"01" + // aborted_transactions: empty
+				"ffffffff" + // preferred_read_replica: -1
+				"05 deadbeef" + // records: 4 bytes
+				"00 00 00",
+		},
+		{
 			name: "several topics and partitions",
 			topics: []fetchTopicResponse{
 				{
@@ -643,6 +668,194 @@ func TestFetchEmptyTopic(t *testing.T) {
 					partition.highWatermark, partition.lastStableOffset, partition.logStartOffset)
 			}
 		})
+	}
+}
+
+// Stage eg2: a Fetch request for a topic with a single message is answered
+// with the record batch of that message, exactly as it is stored on disk.
+func TestFetchSingleMessage(t *testing.T) {
+	topicID := testTopicID(0x61)
+	log := encodeRecordBatch(testBatch{
+		baseOffset: 0,
+		timestamp:  1726045973899,
+		values:     [][]byte{[]byte("Hello World!")},
+	})
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "bar", id: testTopicID(0x60), partitions: []int32{0}},
+		testTopic{name: "foo", id: topicID, partitions: []int32{0}},
+	)
+	writeLogSegment(t, logDir, "foo", 0, log)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := fetch(t, addr, fetchTopic{topicID: topicID, partitions: []fetchPartition{{index: 0}}})
+
+	// The error code of the response is 0 (No Error), its throttle_time_ms
+	// is 0.
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+	if body.throttleTimeMs != 0 {
+		t.Errorf("throttle_time_ms = %d, want 0", body.throttleTimeMs)
+	}
+
+	// The responses field has 1 element, whose topic_id matches what was
+	// sent in the request.
+	if len(body.topics) != 1 {
+		t.Fatalf("responses has %d elements, want 1", len(body.topics))
+	}
+	topic := body.topics[0]
+	if topic.topicID != topicID {
+		t.Errorf("topic_id = %v, want %v", topic.topicID, topicID)
+	}
+
+	// The partitions array has 1 element, whose partition_index is 0 and
+	// whose error_code is 0 (No Error).
+	if len(topic.partitions) != 1 {
+		t.Fatalf("partitions has %d elements, want 1", len(topic.partitions))
+	}
+	partition := topic.partitions[0]
+	if partition.index != 0 {
+		t.Errorf("partition_index = %d, want 0", partition.index)
+	}
+	if partition.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", partition.errorCode)
+	}
+
+	// The entire record batch is read from disk: the records of the response
+	// are the contents of the log file.
+	if !bytes.Equal(partition.records, log) {
+		t.Errorf("records = % x, want the contents of the log file: % x", partition.records, log)
+	}
+
+	// The records array has 1 element: a batch with the message.
+	batches, err := decodeRecordBatches(partition.records)
+	if err != nil {
+		t.Fatalf("failed to decode the fetched records: %v", err)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("fetched %d record batches, want 1", len(batches))
+	}
+	records := mustDecodeRecords(t, batches[0])
+	if len(records) != 1 || string(records[0].value) != "Hello World!" {
+		t.Errorf("fetched records = %+v, want a single record with the value \"Hello World!\"", records)
+	}
+
+	// The partition holds one record, at the offset 0.
+	if partition.highWatermark != 1 || partition.lastStableOffset != 1 || partition.logStartOffset != 0 {
+		t.Errorf("high_watermark = %d, last_stable_offset = %d, log_start_offset = %d; want 1, 1, 0",
+			partition.highWatermark, partition.lastStableOffset, partition.logStartOffset)
+	}
+}
+
+// Each partition has its own log: the records of a fetched partition come
+// from the directory named after its topic and its index.
+func TestFetchReadsTheLogOfTheRequestedPartition(t *testing.T) {
+	logs := map[string][]byte{
+		"orders-0":      encodeRecordBatch(testBatch{values: [][]byte{[]byte("orders 0")}}),
+		"orders-1":      encodeRecordBatch(testBatch{values: [][]byte{[]byte("orders 1")}}),
+		"orders-10":     encodeRecordBatch(testBatch{values: [][]byte{[]byte("orders 10")}}),
+		"my-topic.v1-0": encodeRecordBatch(testBatch{values: [][]byte{[]byte("my-topic.v1 0")}}),
+	}
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "orders", id: testTopicID(1), partitions: []int32{0, 1, 10}},
+		testTopic{name: "my-topic.v1", id: testTopicID(2), partitions: []int32{0}},
+	)
+	writeLogSegment(t, logDir, "orders", 0, logs["orders-0"])
+	writeLogSegment(t, logDir, "orders", 1, logs["orders-1"])
+	writeLogSegment(t, logDir, "orders", 10, logs["orders-10"])
+	writeLogSegment(t, logDir, "my-topic.v1", 0, logs["my-topic.v1-0"])
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := fetch(t, addr,
+		fetchTopic{topicID: testTopicID(2), partitions: []fetchPartition{{index: 0}}},
+		fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 10}, {index: 0}, {index: 1}}},
+	)
+
+	want := []struct {
+		topicID    uuid
+		partitions []int32
+		logs       []string
+	}{
+		{topicID: testTopicID(2), partitions: []int32{0}, logs: []string{"my-topic.v1-0"}},
+		{topicID: testTopicID(1), partitions: []int32{10, 0, 1}, logs: []string{"orders-10", "orders-0", "orders-1"}},
+	}
+
+	if len(body.topics) != len(want) {
+		t.Fatalf("responses has %d elements, want %d", len(body.topics), len(want))
+	}
+	for i, wantTopic := range want {
+		got := body.topics[i]
+		if got.topicID != wantTopic.topicID {
+			t.Errorf("responses[%d]: topic_id = %v, want %v", i, got.topicID, wantTopic.topicID)
+		}
+		if len(got.partitions) != len(wantTopic.partitions) {
+			t.Fatalf("responses[%d]: partitions has %d elements, want %d", i, len(got.partitions), len(wantTopic.partitions))
+		}
+		for j, index := range wantTopic.partitions {
+			partition := got.partitions[j]
+			if partition.index != index || partition.errorCode != 0 {
+				t.Errorf("responses[%d].partitions[%d] = {index: %d, error_code: %d}, want {index: %d, error_code: 0}",
+					i, j, partition.index, partition.errorCode, index)
+			}
+			if !bytes.Equal(partition.records, logs[wantTopic.logs[j]]) {
+				t.Errorf("responses[%d].partitions[%d]: records are not the contents of the log %s", i, j, wantTopic.logs[j])
+			}
+		}
+	}
+}
+
+// Record batches are passed on as they are stored, without looking at their
+// records: a batch with compressed records can be fetched like any other.
+func TestFetchCompressedBatch(t *testing.T) {
+	log := encodeRecordBatch(testBatch{attributes: 0x01, values: [][]byte{[]byte("pretend this is gzip")}})
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	writeLogSegment(t, logDir, "foo", 0, log)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := fetch(t, addr, fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 0}}})
+
+	if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+		t.Fatalf("unexpected response: %+v", body)
+	}
+	partition := body.topics[0].partitions[0]
+	if partition.errorCode != 0 || !bytes.Equal(partition.records, log) {
+		t.Errorf("partition = {error_code: %d, records: % x}, want the contents of the log file without an error",
+			partition.errorCode, partition.records)
+	}
+}
+
+// A partition whose log can't be read is reported with the error code
+// KAFKA_STORAGE_ERROR (56); the other partitions of the request are served.
+func TestFetchCorruptPartitionLog(t *testing.T) {
+	validLog := encodeRecordBatch(testBatch{values: [][]byte{[]byte("Hello World!")}})
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0, 1}})
+	writeLogSegment(t, logDir, "foo", 0, validLog[:len(validLog)-5])
+	writeLogSegment(t, logDir, "foo", 1, validLog)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := fetch(t, addr, fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 0}, {index: 1}}})
+
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+	if len(body.topics) != 1 || len(body.topics[0].partitions) != 2 {
+		t.Fatalf("unexpected response: %+v", body)
+	}
+
+	expectFetchError(t, body.topics[0].partitions[0], 0, 56)
+
+	healthy := body.topics[0].partitions[1]
+	if healthy.index != 1 || healthy.errorCode != 0 || !bytes.Equal(healthy.records, validLog) {
+		t.Errorf("partition 1 = {index: %d, error_code: %d, records: % x}, want the contents of its log without an error",
+			healthy.index, healthy.errorCode, healthy.records)
 	}
 }
 

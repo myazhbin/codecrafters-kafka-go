@@ -90,3 +90,59 @@ func TestReadLog(t *testing.T) {
 		}
 	})
 }
+
+func TestReadRecordBatches(t *testing.T) {
+	t.Run("log with several batches", func(t *testing.T) {
+		first := encodeRecordBatch(testBatch{baseOffset: 0, values: [][]byte{[]byte("a"), []byte("b")}})
+		second := encodeRecordBatch(testBatch{baseOffset: 2, values: [][]byte{[]byte("c")}})
+
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "00000000000000000000.log"), append(bytes.Clone(first), second...))
+
+		log, batches, err := readRecordBatches(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(log, append(bytes.Clone(first), second...)) {
+			t.Errorf("log = % x, want the contents of the segment", log)
+		}
+		if len(batches) != 2 {
+			t.Fatalf("got %d batches, want 2", len(batches))
+		}
+		if !bytes.Equal(batches[0].raw, first) || !bytes.Equal(batches[1].raw, second) {
+			t.Error("the raw bytes of the batches are not the batches that were written")
+		}
+		if batches[0].baseOffset != 0 || batches[0].lastOffset() != 1 || batches[1].baseOffset != 2 || batches[1].lastOffset() != 2 {
+			t.Errorf("unexpected offsets: %d-%d and %d-%d, want 0-1 and 2-2",
+				batches[0].baseOffset, batches[0].lastOffset(), batches[1].baseOffset, batches[1].lastOffset())
+		}
+	})
+
+	t.Run("missing directory", func(t *testing.T) {
+		log, batches, err := readRecordBatches(filepath.Join(t.TempDir(), "missing-0"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(log) != 0 || len(batches) != 0 {
+			t.Errorf("got %d bytes and %d batches, want an empty log", len(log), len(batches))
+		}
+	})
+
+	t.Run("corrupt log", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "00000000000000000000.log"), []byte{0x00, 0x01, 0x02})
+
+		if _, _, err := readRecordBatches(dir); err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
+
+	t.Run("unreadable log", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "file")
+		writeFile(t, file, []byte("data"))
+
+		if _, _, err := readRecordBatches(file); err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
+}

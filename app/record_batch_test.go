@@ -7,9 +7,24 @@ import (
 	"testing"
 )
 
+// mustDecodeRecords decodes the records of a batch and fails the test if that
+// doesn't work.
+func mustDecodeRecords(t *testing.T, batch recordBatch) []record {
+	t.Helper()
+
+	records, err := batch.records()
+	if err != nil {
+		t.Fatalf("failed to decode the records of the batch at offset %d: %v", batch.baseOffset, err)
+	}
+	return records
+}
+
 func TestDecodeRecordBatches(t *testing.T) {
 	t.Run("batches of the CodeCrafters cluster metadata log", func(t *testing.T) {
-		batches, err := decodeRecordBatches(mustDecodeHex(t, featureLevelBatchHex+sazTopicBatchHex))
+		featureLevelBatch := mustDecodeHex(t, featureLevelBatchHex)
+		topicBatch := mustDecodeHex(t, sazTopicBatchHex)
+
+		batches, err := decodeRecordBatches(append(bytes.Clone(featureLevelBatch), topicBatch...))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -18,7 +33,7 @@ func TestDecodeRecordBatches(t *testing.T) {
 		}
 
 		featureLevel := batches[0]
-		wantHeader := recordBatch{
+		want := recordBatch{
 			baseOffset:           1,
 			partitionLeaderEpoch: 1,
 			crc:                  0xb069457c,
@@ -29,47 +44,57 @@ func TestDecodeRecordBatches(t *testing.T) {
 			producerID:           -1,
 			producerEpoch:        -1,
 			baseSequence:         -1,
+			recordCount:          1,
+			recordData:           featureLevelBatch[61:],
+			raw:                  featureLevelBatch,
 		}
-		gotHeader := featureLevel
-		gotHeader.records = nil
-		if !reflect.DeepEqual(gotHeader, wantHeader) {
-			t.Errorf("first batch = %+v, want %+v", gotHeader, wantHeader)
+		if !reflect.DeepEqual(featureLevel, want) {
+			t.Errorf("first batch = %+v, want %+v", featureLevel, want)
 		}
 		if featureLevel.isControl() {
 			t.Error("first batch is reported as a control batch")
 		}
-		if len(featureLevel.records) != 1 {
-			t.Fatalf("first batch has %d records, want 1", len(featureLevel.records))
+		if got := featureLevel.lastOffset(); got != 1 {
+			t.Errorf("last offset of the first batch = %d, want 1", got)
 		}
-		wantRecord := record{
+
+		wantRecords := []record{{
 			attributes:     0,
 			timestampDelta: 0,
 			offsetDelta:    0,
 			key:            nil,
 			value:          mustDecodeHex(t, "01 0c 00 11 6d657461646174612e76657273696f6e 0014 00"),
 			headers:        nil,
-		}
-		if !reflect.DeepEqual(featureLevel.records[0], wantRecord) {
-			t.Errorf("record = %+v, want %+v", featureLevel.records[0], wantRecord)
+		}}
+		if got := mustDecodeRecords(t, featureLevel); !reflect.DeepEqual(got, wantRecords) {
+			t.Errorf("records = %+v, want %+v", got, wantRecords)
 		}
 
 		topic := batches[1]
-		if topic.baseOffset != 2 || topic.lastOffsetDelta != 1 || topic.crc != 0xc64fa9c1 {
-			t.Errorf("second batch: baseOffset = %d, lastOffsetDelta = %d, crc = %#x; want 2, 1, 0xc64fa9c1",
-				topic.baseOffset, topic.lastOffsetDelta, topic.crc)
+		if topic.baseOffset != 2 || topic.lastOffsetDelta != 1 || topic.crc != 0xc64fa9c1 || topic.recordCount != 2 {
+			t.Errorf("second batch: baseOffset = %d, lastOffsetDelta = %d, crc = %#x, recordCount = %d; want 2, 1, 0xc64fa9c1, 2",
+				topic.baseOffset, topic.lastOffsetDelta, topic.crc, topic.recordCount)
 		}
-		if len(topic.records) != 2 {
-			t.Fatalf("second batch has %d records, want 2", len(topic.records))
+		if got := topic.lastOffset(); got != 3 {
+			t.Errorf("last offset of the second batch = %d, want 3", got)
 		}
-		if got, want := topic.records[0].value, mustDecodeHex(t, "01 02 00 04 73617a 00000000000040008000000000000091 00"); !bytes.Equal(got, want) {
+		if !bytes.Equal(topic.raw, topicBatch) {
+			t.Errorf("raw bytes of the second batch = % x, want % x", topic.raw, topicBatch)
+		}
+
+		records := mustDecodeRecords(t, topic)
+		if len(records) != 2 {
+			t.Fatalf("second batch has %d records, want 2", len(records))
+		}
+		if got, want := records[0].value, mustDecodeHex(t, "01 02 00 04 73617a 00000000000040008000000000000091 00"); !bytes.Equal(got, want) {
 			t.Errorf("topic record value = % x, want % x", got, want)
 		}
-		if got := topic.records[1].offsetDelta; got != 1 {
+		if got := records[1].offsetDelta; got != 1 {
 			t.Errorf("offset delta of the second record = %d, want 1", got)
 		}
 		// The value of the second record is 65 bytes long, which takes two
 		// bytes to encode as a VARINT.
-		if got := len(topic.records[1].value); got != 65 {
+		if got := len(records[1].value); got != 65 {
 			t.Errorf("partition record value is %d bytes long, want 65", got)
 		}
 	})
@@ -127,7 +152,7 @@ func TestDecodeRecordBatches(t *testing.T) {
 
 		got := batches[0]
 		if got.baseOffset != 10 || got.producerID != 5 || got.producerEpoch != 1 || got.baseSequence != 7 ||
-			got.baseTimestamp != 100 || got.maxTimestamp != 200 {
+			got.baseTimestamp != 100 || got.maxTimestamp != 200 || got.lastOffset() != 11 {
 			t.Errorf("unexpected batch header: %+v", got)
 		}
 
@@ -147,8 +172,8 @@ func TestDecodeRecordBatches(t *testing.T) {
 				value:          []byte{},
 			},
 		}
-		if !reflect.DeepEqual(got.records, want) {
-			t.Errorf("records = %+v, want %+v", got.records, want)
+		if records := mustDecodeRecords(t, got); !reflect.DeepEqual(records, want) {
+			t.Errorf("records = %+v, want %+v", records, want)
 		}
 	})
 
@@ -173,6 +198,25 @@ func TestDecodeRecordBatches(t *testing.T) {
 		return b
 	}
 
+	// A compressed batch can be stored and passed on as it is: only looking
+	// at its records is not possible.
+	t.Run("compressed batch", func(t *testing.T) {
+		compressed := withByte(22, 0x01)
+
+		batches, err := decodeRecordBatches(compressed)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(batches) != 1 || !bytes.Equal(batches[0].raw, compressed) || batches[0].lastOffset() != 1 {
+			t.Fatalf("unexpected batches: %+v", batches)
+		}
+
+		_, err = batches[0].records()
+		if err == nil || !strings.Contains(err.Error(), "compressed") {
+			t.Errorf("records() error = %v, want it to mention the compression", err)
+		}
+	})
+
 	errorTests := []struct {
 		name    string
 		input   []byte
@@ -185,10 +229,6 @@ func TestDecodeRecordBatches(t *testing.T) {
 		{name: "negative batch length", input: withByte(8, 0xff)},
 		{name: "batch length too small for the header", input: append(bytes.Clone(validBatch[:11]), 0x04, 0x00, 0x00, 0x00, 0x01)},
 		{name: "unsupported magic", input: withByte(16, 1), wantErr: "magic"},
-		{name: "compressed batch", input: withByte(22, 0x01), wantErr: "compressed"},
-		{name: "more records than the batch holds", input: withByte(60, 2)},
-		{name: "record longer than the batch", input: withByte(61, 0x7e)},
-		{name: "value longer than the record", input: withByte(66, 0x7e)},
 	}
 
 	for _, tt := range errorTests {
@@ -199,6 +239,35 @@ func TestDecodeRecordBatches(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	// Batches whose header is fine, but whose records are not.
+	recordErrorTests := []struct {
+		name  string
+		input []byte
+	}{
+		{name: "more records than the batch holds", input: withByte(60, 2)},
+		{name: "fewer records than the batch holds", input: withByte(60, 0)},
+		{name: "record longer than the batch", input: withByte(61, 0x7e)},
+		{name: "record shorter than its fields", input: withByte(61, 0x06)},
+		{name: "value longer than the record", input: withByte(66, 0x7e)},
+		{name: "negative record count with records", input: withByte(57, 0xff)},
+	}
+
+	for _, tt := range recordErrorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			batches, err := decodeRecordBatches(tt.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(batches) != 1 {
+				t.Fatalf("decoded %d batches, want 1", len(batches))
+			}
+
+			if records, err := batches[0].records(); err == nil {
+				t.Errorf("expected an error, got the records %+v", records)
 			}
 		})
 	}

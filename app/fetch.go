@@ -82,6 +82,10 @@ type fetchPartitionResponse struct {
 	// its first record. Both are -1 when the fetch failed.
 	highWatermark  int64
 	logStartOffset int64
+
+	// records holds the record batches that the client asked for, as they
+	// are stored in the log of the partition.
+	records []byte
 }
 
 // fetchError returns the response for a partition that can't be fetched from.
@@ -116,7 +120,7 @@ func encodeFetchResponse(topics []fetchTopicResponse) []byte {
 			e.int64(partition.logStartOffset)
 			e.compactArrayLength(0) // aborted_transactions
 			e.int32(-1)             // preferred_read_replica: none
-			e.compactBytes(nil)     // records
+			e.compactBytes(partition.records)
 			e.emptyTaggedFields()
 		}
 		e.emptyTaggedFields()
@@ -143,7 +147,7 @@ func (b *broker) handleFetch(d *decoder) ([]byte, error) {
 	for _, topic := range request.topics {
 		response := fetchTopicResponse{topicID: topic.topicID}
 		for _, partition := range topic.partitions {
-			response.partitions = append(response.partitions, fetchFromPartition(metadata, topic.topicID, partition))
+			response.partitions = append(response.partitions, b.fetchFromPartition(metadata, topic.topicID, partition))
 		}
 		topics = append(topics, response)
 	}
@@ -152,8 +156,9 @@ func (b *broker) handleFetch(d *decoder) ([]byte, error) {
 }
 
 // fetchFromPartition answers the part of a Fetch request that is about one
-// partition of the topic with the given ID.
-func fetchFromPartition(metadata *clusterMetadata, topicID uuid, partition fetchPartition) fetchPartitionResponse {
+// partition of the topic with the given ID: it reads the record batches of the
+// partition from its log on disk.
+func (b *broker) fetchFromPartition(metadata *clusterMetadata, topicID uuid, partition fetchPartition) fetchPartitionResponse {
 	topic, ok := metadata.topicsByID[topicID]
 	if !ok {
 		return fetchError(partition.index, errorCodeUnknownTopicID)
@@ -162,7 +167,17 @@ func fetchFromPartition(metadata *clusterMetadata, topicID uuid, partition fetch
 		return fetchError(partition.index, errorCodeUnknownTopicOrPartition)
 	}
 
-	// The broker can't read the records of partitions yet: they all look
-	// empty, with the offset 0 as their start and end.
-	return fetchPartitionResponse{index: partition.index}
+	log, batches, err := readRecordBatches(partitionDir(b.logDir, topic.name, partition.index))
+	if err != nil {
+		fmt.Printf("Error reading the log of partition %d of topic %s: %v\n", partition.index, topic.name, err)
+		return fetchError(partition.index, errorCodeKafkaStorageError)
+	}
+
+	// A partition without records starts and ends at the offset 0.
+	response := fetchPartitionResponse{index: partition.index, records: log}
+	if len(batches) > 0 {
+		response.logStartOffset = batches[0].baseOffset
+		response.highWatermark = batches[len(batches)-1].lastOffset() + 1
+	}
+	return response
 }

@@ -57,12 +57,7 @@ func newClusterMetadata() *clusterMetadata {
 // metadata log of a broker that stores its logs in logDir. Without such a log,
 // the cluster has no topics.
 func loadClusterMetadata(logDir string) (*clusterMetadata, error) {
-	log, err := readLog(partitionDir(logDir, clusterMetadataTopic, 0))
-	if err != nil {
-		return nil, fmt.Errorf("reading cluster metadata log: %w", err)
-	}
-
-	batches, err := decodeRecordBatches(log)
+	_, batches, err := readRecordBatches(partitionDir(logDir, clusterMetadataTopic, 0))
 	if err != nil {
 		return nil, fmt.Errorf("reading cluster metadata log: %w", err)
 	}
@@ -75,7 +70,11 @@ func loadClusterMetadata(logDir string) (*clusterMetadata, error) {
 			continue
 		}
 
-		for i, record := range batch.records {
+		records, err := batch.records()
+		if err != nil {
+			return nil, fmt.Errorf("reading cluster metadata log: batch at offset %d: %w", batch.baseOffset, err)
+		}
+		for i, record := range records {
 			if err := metadata.replay(record.value); err != nil {
 				return nil, fmt.Errorf("reading cluster metadata log: record at offset %d: %w", batch.baseOffset+int64(i), err)
 			}
