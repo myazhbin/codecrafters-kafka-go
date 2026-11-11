@@ -10,6 +10,7 @@ const (
 // Error codes of the Kafka protocol.
 const (
 	errorCodeNone                    int16 = 0
+	errorCodeOffsetOutOfRange        int16 = 1
 	errorCodeUnknownTopicOrPartition int16 = 3
 	errorCodeUnsupportedVersion      int16 = 35
 	errorCodeKafkaStorageError       int16 = 56

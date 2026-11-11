@@ -157,7 +157,9 @@ func (b *broker) handleFetch(d *decoder) ([]byte, error) {
 
 // fetchFromPartition answers the part of a Fetch request that is about one
 // partition of the topic with the given ID: it reads the record batches of the
-// partition from its log on disk.
+// partition from its log on disk, starting at the offset that the client asked
+// for. The limits that the request sets on the size of the response are not
+// taken into account.
 func (b *broker) fetchFromPartition(metadata *clusterMetadata, topicID uuid, partition fetchPartition) fetchPartitionResponse {
 	topic, ok := metadata.topicsByID[topicID]
 	if !ok {
@@ -174,10 +176,33 @@ func (b *broker) fetchFromPartition(metadata *clusterMetadata, topicID uuid, par
 	}
 
 	// A partition without records starts and ends at the offset 0.
-	response := fetchPartitionResponse{index: partition.index, records: log}
+	var logStartOffset, logEndOffset int64
 	if len(batches) > 0 {
-		response.logStartOffset = batches[0].baseOffset
-		response.highWatermark = batches[len(batches)-1].lastOffset() + 1
+		logStartOffset = batches[0].baseOffset
+		logEndOffset = batches[len(batches)-1].lastOffset() + 1
 	}
-	return response
+
+	// Fetching from the end of the log is fine: there just are no records to
+	// return yet.
+	if partition.fetchOffset < logStartOffset || partition.fetchOffset > logEndOffset {
+		return fetchError(partition.index, errorCodeOffsetOutOfRange)
+	}
+
+	// Batches are always returned as a whole: the response starts with the
+	// batch that holds the record at the fetch offset, even if that record
+	// is not the first one of the batch.
+	skipped := 0
+	for _, batch := range batches {
+		if batch.lastOffset() >= partition.fetchOffset {
+			break
+		}
+		skipped += len(batch.raw)
+	}
+
+	return fetchPartitionResponse{
+		index:          partition.index,
+		highWatermark:  logEndOffset,
+		logStartOffset: logStartOffset,
+		records:        log[skipped:],
+	}
 }

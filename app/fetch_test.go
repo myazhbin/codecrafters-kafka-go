@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -746,6 +748,252 @@ func TestFetchSingleMessage(t *testing.T) {
 	if partition.highWatermark != 1 || partition.lastStableOffset != 1 || partition.logStartOffset != 0 {
 		t.Errorf("high_watermark = %d, last_stable_offset = %d, log_start_offset = %d; want 1, 1, 0",
 			partition.highWatermark, partition.lastStableOffset, partition.logStartOffset)
+	}
+}
+
+// fetchedValues decodes the record batches of a fetched partition and returns
+// the values of the records of each batch.
+func fetchedValues(t *testing.T, partition fetchedPartition) [][]string {
+	t.Helper()
+
+	batches, err := decodeRecordBatches(partition.records)
+	if err != nil {
+		t.Fatalf("failed to decode the fetched records: %v", err)
+	}
+
+	var values [][]string
+	for _, batch := range batches {
+		var batchValues []string
+		for _, record := range mustDecodeRecords(t, batch) {
+			batchValues = append(batchValues, string(record.value))
+		}
+		values = append(values, batchValues)
+	}
+	return values
+}
+
+// Stage fd8: a Fetch request for a topic with several messages is answered
+// with all the record batches of the partition, exactly as they are stored on
+// disk.
+func TestFetchMultipleMessages(t *testing.T) {
+	topicID := testTopicID(0x71)
+
+	// Like the CodeCrafters tester, every message is written as a batch of
+	// its own.
+	var log []byte
+	for offset, message := range []string{"Hello Earth!", "Hello World!", "Hello Kafka!"} {
+		log = append(log, encodeRecordBatch(testBatch{
+			baseOffset: int64(offset),
+			timestamp:  1726045973899,
+			values:     [][]byte{[]byte(message)},
+		})...)
+	}
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "bar", id: testTopicID(0x70), partitions: []int32{0}},
+		testTopic{name: "foo", id: topicID, partitions: []int32{0, 1}},
+	)
+	writeLogSegment(t, logDir, "foo", 1, log)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := fetch(t, addr, fetchTopic{topicID: topicID, partitions: []fetchPartition{{index: 1}}})
+
+	// The error code of the response is 0 (No Error), its throttle_time_ms
+	// is 0.
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+	if body.throttleTimeMs != 0 {
+		t.Errorf("throttle_time_ms = %d, want 0", body.throttleTimeMs)
+	}
+
+	// The responses field has 1 element, whose topic_id matches what was
+	// sent in the request.
+	if len(body.topics) != 1 {
+		t.Fatalf("responses has %d elements, want 1", len(body.topics))
+	}
+	topic := body.topics[0]
+	if topic.topicID != topicID {
+		t.Errorf("topic_id = %v, want %v", topic.topicID, topicID)
+	}
+
+	// The partitions array has 1 element, whose partition_index matches what
+	// was sent in the request and whose error_code is 0 (No Error).
+	if len(topic.partitions) != 1 {
+		t.Fatalf("partitions has %d elements, want 1", len(topic.partitions))
+	}
+	partition := topic.partitions[0]
+	if partition.index != 1 {
+		t.Errorf("partition_index = %d, want 1", partition.index)
+	}
+	if partition.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", partition.errorCode)
+	}
+
+	// The entire record batches are read from disk: the records of the
+	// response are the contents of the log file.
+	if !bytes.Equal(partition.records, log) {
+		t.Errorf("records = % x, want the contents of the log file: % x", partition.records, log)
+	}
+
+	// The records array has the correct number of elements.
+	want := [][]string{{"Hello Earth!"}, {"Hello World!"}, {"Hello Kafka!"}}
+	if got := fetchedValues(t, partition); !reflect.DeepEqual(got, want) {
+		t.Errorf("fetched messages = %q, want %q", got, want)
+	}
+
+	// The partition holds three records, at the offsets 0 to 2.
+	if partition.highWatermark != 3 || partition.lastStableOffset != 3 || partition.logStartOffset != 0 {
+		t.Errorf("high_watermark = %d, last_stable_offset = %d, log_start_offset = %d; want 3, 3, 0",
+			partition.highWatermark, partition.lastStableOffset, partition.logStartOffset)
+	}
+}
+
+// The records of a Fetch response start at the fetch offset of the request.
+func TestFetchFromOffset(t *testing.T) {
+	// Three batches, with the records at the offsets 0-1, 2 and 3-5.
+	batches := [][]byte{
+		encodeRecordBatch(testBatch{baseOffset: 0, values: [][]byte{[]byte("a0"), []byte("a1")}}),
+		encodeRecordBatch(testBatch{baseOffset: 2, values: [][]byte{[]byte("b2")}}),
+		encodeRecordBatch(testBatch{baseOffset: 3, values: [][]byte{[]byte("c3"), []byte("c4"), []byte("c5")}}),
+	}
+	a, b, c := []string{"a0", "a1"}, []string{"b2"}, []string{"c3", "c4", "c5"}
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	writeLogSegment(t, logDir, "foo", 0, bytes.Join(batches, nil))
+	addr := startTestServerWithLogDir(t, logDir)
+
+	tests := []struct {
+		name          string
+		fetchOffset   int64
+		wantErrorCode int16
+		want          [][]string
+	}{
+		{name: "start of the log", fetchOffset: 0, want: [][]string{a, b, c}},
+		// Batches are never split: the whole batch that holds the offset 1
+		// is returned.
+		{name: "inside the first batch", fetchOffset: 1, want: [][]string{a, b, c}},
+		{name: "start of the second batch", fetchOffset: 2, want: [][]string{b, c}},
+		{name: "start of the last batch", fetchOffset: 3, want: [][]string{c}},
+		{name: "inside the last batch", fetchOffset: 4, want: [][]string{c}},
+		{name: "last record", fetchOffset: 5, want: [][]string{c}},
+		// The client has read everything: there is nothing to return yet.
+		{name: "end of the log", fetchOffset: 6, want: nil},
+		// OFFSET_OUT_OF_RANGE (1).
+		{name: "past the end of the log", fetchOffset: 7, wantErrorCode: 1},
+		{name: "far past the end of the log", fetchOffset: 1 << 40, wantErrorCode: 1},
+		{name: "negative offset", fetchOffset: -1, wantErrorCode: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := fetch(t, addr, fetchTopic{
+				topicID:    testTopicID(1),
+				partitions: []fetchPartition{{index: 0, fetchOffset: tt.fetchOffset}},
+			})
+
+			if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+				t.Fatalf("unexpected response: %+v", body)
+			}
+			partition := body.topics[0].partitions[0]
+
+			if tt.wantErrorCode != 0 {
+				expectFetchError(t, partition, 0, tt.wantErrorCode)
+				return
+			}
+
+			if partition.errorCode != 0 {
+				t.Errorf("error_code = %d, want 0", partition.errorCode)
+			}
+			if got := fetchedValues(t, partition); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("fetched records = %q, want %q", got, tt.want)
+			}
+
+			// The offsets of the partition don't depend on what was fetched.
+			if partition.highWatermark != 6 || partition.logStartOffset != 0 {
+				t.Errorf("high_watermark = %d, log_start_offset = %d; want 6, 0", partition.highWatermark, partition.logStartOffset)
+			}
+		})
+	}
+}
+
+// An empty partition can only be fetched from the offset 0.
+func TestFetchFromOffsetOfEmptyPartition(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	addr := startTestServerWithLogDir(t, logDir)
+
+	for fetchOffset, wantErrorCode := range map[int64]int16{0: 0, 1: 1, -1: 1} {
+		body := fetch(t, addr, fetchTopic{
+			topicID:    testTopicID(1),
+			partitions: []fetchPartition{{index: 0, fetchOffset: fetchOffset}},
+		})
+
+		if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+			t.Fatalf("unexpected response: %+v", body)
+		}
+		if got := body.topics[0].partitions[0].errorCode; got != wantErrorCode {
+			t.Errorf("fetch offset %d: error_code = %d, want %d", fetchOffset, got, wantErrorCode)
+		}
+	}
+}
+
+// The log of a partition may be split into several segment files, and its
+// first records may have been deleted.
+func TestFetchFromLogWithSeveralSegments(t *testing.T) {
+	first := encodeRecordBatch(testBatch{baseOffset: 10, values: [][]byte{[]byte("r10"), []byte("r11")}})
+	second := encodeRecordBatch(testBatch{baseOffset: 12, values: [][]byte{[]byte("r12")}})
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	dir := filepath.Join(logDir, "foo-0")
+	writeFile(t, filepath.Join(dir, "00000000000000000010.log"), first)
+	writeFile(t, filepath.Join(dir, "00000000000000000012.log"), second)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	tests := []struct {
+		fetchOffset   int64
+		wantErrorCode int16
+		want          [][]string
+	}{
+		{fetchOffset: 10, want: [][]string{{"r10", "r11"}, {"r12"}}},
+		{fetchOffset: 12, want: [][]string{{"r12"}}},
+		{fetchOffset: 13, want: nil},
+		// The records before the offset 10 are gone.
+		{fetchOffset: 9, wantErrorCode: 1},
+		{fetchOffset: 0, wantErrorCode: 1},
+		{fetchOffset: 14, wantErrorCode: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("fetch offset %d", tt.fetchOffset), func(t *testing.T) {
+			body := fetch(t, addr, fetchTopic{
+				topicID:    testTopicID(1),
+				partitions: []fetchPartition{{index: 0, fetchOffset: tt.fetchOffset}},
+			})
+
+			if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+				t.Fatalf("unexpected response: %+v", body)
+			}
+			partition := body.topics[0].partitions[0]
+
+			if tt.wantErrorCode != 0 {
+				expectFetchError(t, partition, 0, tt.wantErrorCode)
+				return
+			}
+
+			if partition.errorCode != 0 {
+				t.Errorf("error_code = %d, want 0", partition.errorCode)
+			}
+			if got := fetchedValues(t, partition); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("fetched records = %q, want %q", got, tt.want)
+			}
+			if partition.highWatermark != 13 || partition.logStartOffset != 10 {
+				t.Errorf("high_watermark = %d, log_start_offset = %d; want 13, 10", partition.highWatermark, partition.logStartOffset)
+			}
+		})
 	}
 }
 
