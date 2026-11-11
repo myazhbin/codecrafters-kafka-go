@@ -113,6 +113,28 @@ func TestEncodeApiVersionsResponse(t *testing.T) {
 				"00", // TAG_BUFFER:        empty
 		},
 		{
+			// The response body from the "Include DescribeTopicPartitions in
+			// ApiVersions" stage instructions.
+			name:      "ApiVersions and DescribeTopicPartitions",
+			errorCode: 0,
+			apis: []apiVersionRange{
+				{apiKey: 18, minVersion: 0, maxVersion: 4},
+				{apiKey: 75, minVersion: 0, maxVersion: 0},
+			},
+			want: "0000" + // error_code:        0 (no error)
+				"03" + // api_keys array:    2 elements (compact array encoding)
+				"0012" + // api_key:           18 (ApiVersions)
+				"0000" + // min_version:       0
+				"0004" + // max_version:       4
+				"00" + // TAG_BUFFER:        empty
+				"004b" + // api_key:           75 (DescribeTopicPartitions)
+				"0000" + // min_version:       0
+				"0000" + // max_version:       0
+				"00" + // TAG_BUFFER:        empty
+				"00000000" + // throttle_time_ms:  0
+				"00", // TAG_BUFFER:        empty
+		},
+		{
 			name:      "several APIs",
 			errorCode: 0,
 			apis: []apiVersionRange{
@@ -183,6 +205,11 @@ func TestSupportedAPIs(t *testing.T) {
 	if got, want := findAPI(t, supportedAPIs, 18), (apiVersionRange{apiKey: 18, minVersion: 0, maxVersion: 4}); got != want {
 		t.Errorf("ApiVersions entry = %+v, want %+v", got, want)
 	}
+
+	// The broker supports version 0 of DescribeTopicPartitions.
+	if got, want := findAPI(t, supportedAPIs, 75), (apiVersionRange{apiKey: 75, minVersion: 0, maxVersion: 0}); got != want {
+		t.Errorf("DescribeTopicPartitions entry = %+v, want %+v", got, want)
+	}
 }
 
 func TestSupportsVersion(t *testing.T) {
@@ -195,6 +222,10 @@ func TestSupportsVersion(t *testing.T) {
 		{apiKey: 18, apiVersion: 0, want: true},
 		{apiKey: 18, apiVersion: 4, want: true},
 		{apiKey: 18, apiVersion: 5, want: false},
+
+		{apiKey: 75, apiVersion: -1, want: false},
+		{apiKey: 75, apiVersion: 0, want: true},
+		{apiKey: 75, apiVersion: 1, want: false},
 
 		// An API that the broker doesn't know supports no version at all.
 		{apiKey: 9999, apiVersion: 0, want: false},
@@ -330,6 +361,41 @@ func TestHandleApiVersionsRequest(t *testing.T) {
 	// min_version is 0 and the max_version is 4.
 	if got, want := findAPI(t, body.apiKeys, 18), (apiVersionRange{apiKey: 18, minVersion: 0, maxVersion: 4}); got != want {
 		t.Errorf("ApiVersions entry = %+v, want %+v", got, want)
+	}
+
+	expectNoMoreData(t, conn)
+}
+
+// Stage yk1: the ApiVersions response advertises the DescribeTopicPartitions
+// API next to the ApiVersions API.
+func TestApiVersionsIncludesDescribeTopicPartitions(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	send(t, conn, apiVersionsRequest(1737034428))
+
+	response := readResponse(t, conn)
+	if want := int32(4 + len(response.body)); response.messageSize != want {
+		t.Errorf("message_size = %d, want %d", response.messageSize, want)
+	}
+	if response.correlationID != 1737034428 {
+		t.Errorf("correlation_id = %d, want 1737034428", response.correlationID)
+	}
+
+	body := decodeApiVersionsResponse(t, response.body)
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+
+	// API key 18 (ApiVersions): min_version 0, max_version at least 4.
+	if api := findAPI(t, body.apiKeys, 18); api.minVersion != 0 || api.maxVersion < 4 {
+		t.Errorf("ApiVersions entry = %+v, want min_version 0 and max_version >= 4", api)
+	}
+
+	// API key 75 (DescribeTopicPartitions): min_version 0, max_version at
+	// least 0.
+	if api := findAPI(t, body.apiKeys, 75); api.minVersion != 0 || api.maxVersion < 0 {
+		t.Errorf("DescribeTopicPartitions entry = %+v, want min_version 0 and max_version >= 0", api)
 	}
 
 	expectNoMoreData(t, conn)

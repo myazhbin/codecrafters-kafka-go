@@ -2,7 +2,8 @@ package main
 
 // API keys of the Kafka protocol.
 const (
-	apiKeyApiVersions int16 = 18
+	apiKeyApiVersions             int16 = 18
+	apiKeyDescribeTopicPartitions int16 = 75
 )
 
 // Error codes of the Kafka protocol.
@@ -22,6 +23,7 @@ type apiVersionRange struct {
 // advertises in its ApiVersions responses.
 var supportedAPIs = []apiVersionRange{
 	{apiKey: apiKeyApiVersions, minVersion: 0, maxVersion: 4},
+	{apiKey: apiKeyDescribeTopicPartitions, minVersion: 0, maxVersion: 0},
 }
 
 // supportsVersion reports whether the broker supports the given version of an
