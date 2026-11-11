@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -20,8 +19,7 @@ func serve(l net.Listener) error {
 	}
 }
 
-// handleConnection reads a request from conn and answers it with a response
-// that echoes the correlation ID of the request.
+// handleConnection reads a request from conn and answers it.
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -40,17 +38,10 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	if _, err := conn.Write(encodeResponse(header.correlationID)); err != nil {
+	// Every request is treated as an ApiVersions request for now.
+	body := handleApiVersions(header)
+
+	if _, err := conn.Write(encodeResponse(header.correlationID, body)); err != nil {
 		fmt.Println("Error writing response: ", err.Error())
 	}
-}
-
-// encodeResponse builds a Kafka response message: a 4-byte message_size
-// followed by a response header v0, which only holds the correlation ID.
-// All integers are big-endian.
-func encodeResponse(correlationID int32) []byte {
-	header := binary.BigEndian.AppendUint32(nil, uint32(correlationID))
-
-	message := binary.BigEndian.AppendUint32(nil, uint32(len(header)))
-	return append(message, header...)
 }

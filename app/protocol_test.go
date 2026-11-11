@@ -3,10 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"io"
-	"strings"
 	"testing"
 	"testing/iotest"
 )
@@ -22,17 +20,6 @@ const exampleRequestHex = "00000023" + // message_size:        35
 	"0a6b61666b612d636c69" + // client_software_name:    "kafka-cli"
 	"04302e31" + // client_software_version: "0.1"
 	"00" // tag buffer
-
-// mustDecodeHex decodes a hex string, ignoring any whitespace in it.
-func mustDecodeHex(t *testing.T, s string) []byte {
-	t.Helper()
-
-	b, err := hex.DecodeString(strings.Join(strings.Fields(s), ""))
-	if err != nil {
-		t.Fatalf("invalid hex string %q: %v", s, err)
-	}
-	return b
-}
 
 func TestReadMessage(t *testing.T) {
 	t.Run("returns the header and body", func(t *testing.T) {
@@ -316,5 +303,61 @@ func TestDecoderErrorIsSticky(t *testing.T) {
 	}
 	if len(d.buf) != 3 {
 		t.Errorf("expected no input to be consumed after an error, %d bytes left", len(d.buf))
+	}
+}
+
+func TestEncodeResponse(t *testing.T) {
+	tests := []struct {
+		name          string
+		correlationID int32
+		body          string
+		want          string
+	}{
+		{
+			name:          "header only",
+			correlationID: 7,
+			body:          "",
+			want:          "00000004 00000007",
+		},
+		{
+			name:          "big-endian byte order",
+			correlationID: 0x01020304,
+			body:          "",
+			want:          "00000004 01020304",
+		},
+		{
+			name:          "negative correlation ID",
+			correlationID: -1,
+			body:          "",
+			want:          "00000004 ffffffff",
+		},
+		{
+			name:          "message_size covers the header and the body",
+			correlationID: 1333056139,
+			body:          "0023",
+			want:          "00000006 4f74d28b 0023",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := encodeResponse(tt.correlationID, mustDecodeHex(t, tt.body))
+			if want := mustDecodeHex(t, tt.want); !bytes.Equal(got, want) {
+				t.Errorf("encodeResponse(%d, %s) = % x, want % x", tt.correlationID, tt.body, got, want)
+			}
+		})
+	}
+}
+
+func TestEncoderIntegers(t *testing.T) {
+	var e encoder
+	e.int16(0x0102)
+	e.int16(-2)
+	e.int32(0x01020304)
+	e.int32(-2)
+	e.raw([]byte{0xaa, 0xbb})
+
+	if want := mustDecodeHex(t, "0102 fffe 01020304 fffffffe aabb"); !bytes.Equal(e.buf, want) {
+		t.Errorf("encoded = % x, want % x", e.buf, want)
 	}
 }

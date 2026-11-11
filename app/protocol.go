@@ -161,3 +161,38 @@ func (d *decoder) taggedFields() {
 		d.bytes(int(size))
 	}
 }
+
+// encodeResponse builds a Kafka response message: a 4-byte message_size
+// followed by a response header v0, which only holds the correlation ID, and
+// the response body.
+func encodeResponse(correlationID int32, body []byte) []byte {
+	const headerSize = 4
+
+	var e encoder
+	e.int32(int32(headerSize + len(body))) // message_size
+	e.int32(correlationID)
+	e.raw(body)
+
+	return e.buf
+}
+
+// encoder builds a message out of Kafka protocol primitive types. All integers
+// are big-endian.
+type encoder struct {
+	buf []byte
+}
+
+// raw appends bytes that are already encoded.
+func (e *encoder) raw(b []byte) {
+	e.buf = append(e.buf, b...)
+}
+
+// int16 encodes an INT16.
+func (e *encoder) int16(v int16) {
+	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(v))
+}
+
+// int32 encodes an INT32.
+func (e *encoder) int32(v int32) {
+	e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
+}
