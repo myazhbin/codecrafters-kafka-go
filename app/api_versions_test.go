@@ -309,7 +309,7 @@ func TestParseAPIVersion(t *testing.T) {
 			addr := startTestServer(t)
 			conn := dial(t, addr)
 
-			send(t, conn, apiVersionsRequestWithVersion(tt.apiVersion, 42))
+			send(t, conn, newApiVersionsRequestWithVersion(tt.apiVersion, 42))
 
 			response := readResponse(t, conn)
 			if response.correlationID != 42 {
@@ -331,7 +331,7 @@ func TestHandleApiVersionsRequest(t *testing.T) {
 	conn := dial(t, addr)
 
 	// The request from the stage instructions (correlation ID 0x67890abc).
-	send(t, conn, apiVersionsRequest(1737034428))
+	send(t, conn, newApiVersionsRequest(1737034428))
 
 	response := readResponse(t, conn)
 
@@ -372,7 +372,7 @@ func TestApiVersionsIncludesDescribeTopicPartitions(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
 
-	send(t, conn, apiVersionsRequest(1737034428))
+	send(t, conn, newApiVersionsRequest(1737034428))
 
 	response := readResponse(t, conn)
 	if want := int32(4 + len(response.body)); response.messageSize != want {

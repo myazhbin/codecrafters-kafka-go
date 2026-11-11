@@ -8,8 +8,9 @@ const (
 
 // Error codes of the Kafka protocol.
 const (
-	errorCodeNone               int16 = 0
-	errorCodeUnsupportedVersion int16 = 35
+	errorCodeNone                    int16 = 0
+	errorCodeUnknownTopicOrPartition int16 = 3
+	errorCodeUnsupportedVersion      int16 = 35
 )
 
 // apiVersionRange is the range of versions of an API that the broker supports.

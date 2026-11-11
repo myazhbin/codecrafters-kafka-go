@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"testing/iotest"
 )
@@ -191,8 +192,14 @@ func TestDecodeRequestHeader(t *testing.T) {
 }
 
 func TestDecoderIntegers(t *testing.T) {
-	d := newDecoder(mustDecodeHex(t, "0102 fffe 01020304 fffffffe"))
+	d := newDecoder(mustDecodeHex(t, "01 ff 0102 fffe 01020304 fffffffe"))
 
+	if got := d.int8(); got != 1 {
+		t.Errorf("int8() = %d, want 1", got)
+	}
+	if got := d.int8(); got != -1 {
+		t.Errorf("int8() = %d, want -1", got)
+	}
 	if got := d.int16(); got != 0x0102 {
 		t.Errorf("int16() = %#x, want 0x0102", got)
 	}
@@ -287,8 +294,17 @@ func TestDecoderErrorIsSticky(t *testing.T) {
 	if got := d.int16(); got != 0 {
 		t.Errorf("int16() after an error = %d, want 0", got)
 	}
+	if got := d.int8(); got != 0 {
+		t.Errorf("int8() after an error = %d, want 0", got)
+	}
 	if got := d.uvarint(); got != 0 {
 		t.Errorf("uvarint() after an error = %d, want 0", got)
+	}
+	if got := d.compactString(); got != "" {
+		t.Errorf("compactString() after an error = %q, want \"\"", got)
+	}
+	if got := d.compactArrayLength(); got != 0 {
+		t.Errorf("compactArrayLength() after an error = %d, want 0", got)
 	}
 	if got := d.nullableString(); got != nil {
 		t.Errorf("nullableString() after an error = %q, want nil", *got)
@@ -309,41 +325,60 @@ func TestDecoderErrorIsSticky(t *testing.T) {
 func TestEncodeResponse(t *testing.T) {
 	tests := []struct {
 		name          string
+		headerVersion int
 		correlationID int32
 		body          string
 		want          string
 	}{
 		{
-			name:          "header only",
+			name:          "header v0 only",
+			headerVersion: responseHeaderV0,
 			correlationID: 7,
 			body:          "",
 			want:          "00000004 00000007",
 		},
 		{
 			name:          "big-endian byte order",
+			headerVersion: responseHeaderV0,
 			correlationID: 0x01020304,
 			body:          "",
 			want:          "00000004 01020304",
 		},
 		{
 			name:          "negative correlation ID",
+			headerVersion: responseHeaderV0,
 			correlationID: -1,
 			body:          "",
 			want:          "00000004 ffffffff",
 		},
 		{
 			name:          "message_size covers the header and the body",
+			headerVersion: responseHeaderV0,
 			correlationID: 1333056139,
 			body:          "0023",
 			want:          "00000006 4f74d28b 0023",
+		},
+		{
+			name:          "header v1 adds an empty tag buffer",
+			headerVersion: responseHeaderV1,
+			correlationID: 7,
+			body:          "",
+			want:          "00000005 00000007 00",
+		},
+		{
+			name:          "header v1 with a body",
+			headerVersion: responseHeaderV1,
+			correlationID: 7,
+			body:          "aabbcc",
+			want:          "00000008 00000007 00 aabbcc",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := encodeResponse(tt.correlationID, mustDecodeHex(t, tt.body))
+			got := encodeResponse(tt.headerVersion, tt.correlationID, mustDecodeHex(t, tt.body))
 			if want := mustDecodeHex(t, tt.want); !bytes.Equal(got, want) {
-				t.Errorf("encodeResponse(%d, %s) = % x, want % x", tt.correlationID, tt.body, got, want)
+				t.Errorf("encodeResponse(%d, %d, %s) = % x, want % x", tt.headerVersion, tt.correlationID, tt.body, got, want)
 			}
 		})
 	}
@@ -351,14 +386,146 @@ func TestEncodeResponse(t *testing.T) {
 
 func TestEncoderIntegers(t *testing.T) {
 	var e encoder
+	e.int8(0x01)
+	e.int8(-1)
 	e.int16(0x0102)
 	e.int16(-2)
 	e.int32(0x01020304)
 	e.int32(-2)
 	e.raw([]byte{0xaa, 0xbb})
 
-	if want := mustDecodeHex(t, "0102 fffe 01020304 fffffffe aabb"); !bytes.Equal(e.buf, want) {
+	if want := mustDecodeHex(t, "01 ff 0102 fffe 01020304 fffffffe aabb"); !bytes.Equal(e.buf, want) {
 		t.Errorf("encoded = % x, want % x", e.buf, want)
+	}
+}
+
+func TestEncoderBoolean(t *testing.T) {
+	var e encoder
+	e.boolean(false)
+	e.boolean(true)
+
+	if want := []byte{0x00, 0x01}; !bytes.Equal(e.buf, want) {
+		t.Errorf("encoded = % x, want % x", e.buf, want)
+	}
+}
+
+func TestEncoderUUID(t *testing.T) {
+	id := uuid(mustDecodeHex(t, "00010203 0405 0607 0809 0a0b0c0d0e0f"))
+
+	var e encoder
+	e.uuid(id)
+	e.uuid(uuid{})
+
+	if want := mustDecodeHex(t, "000102030405060708090a0b0c0d0e0f 00000000000000000000000000000000"); !bytes.Equal(e.buf, want) {
+		t.Errorf("encoded = % x, want % x", e.buf, want)
+	}
+}
+
+func TestUUIDString(t *testing.T) {
+	tests := []struct {
+		id   uuid
+		want string
+	}{
+		{id: uuid{}, want: "00000000-0000-0000-0000-000000000000"},
+		{id: uuid(mustDecodeHex(t, "000102030405060708090a0b0c0d0e0f")), want: "00010203-0405-0607-0809-0a0b0c0d0e0f"},
+		{id: uuid(mustDecodeHex(t, "71a59a5189694f8ba7a6a1aa3bc6d8d5")), want: "71a59a51-8969-4f8b-a7a6-a1aa3bc6d8d5"},
+	}
+
+	for _, tt := range tests {
+		if got := tt.id.String(); got != tt.want {
+			t.Errorf("String() = %q, want %q", got, tt.want)
+		}
+	}
+}
+
+func TestCompactString(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "", want: "01"},
+		{value: "foo", want: "04 666f6f"},
+		{value: "kafka-cli", want: "0a 6b61666b612d636c69"},
+		{value: strings.Repeat("a", 127), want: "8001" + strings.Repeat("61", 127)},
+	}
+
+	for _, tt := range tests {
+		var e encoder
+		e.compactString(tt.value)
+
+		if want := mustDecodeHex(t, tt.want); !bytes.Equal(e.buf, want) {
+			t.Errorf("compactString(%q) = % x, want % x", tt.value, e.buf, want)
+		}
+
+		// The decoder must read back what the encoder wrote.
+		d := newDecoder(e.buf)
+		if got := d.compactString(); got != tt.value || d.err != nil || len(d.buf) != 0 {
+			t.Errorf("decoded %q (err: %v, %d bytes left), want %q", got, d.err, len(d.buf), tt.value)
+		}
+	}
+
+	errorTests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty input", input: ""},
+		{name: "null string", input: "00"},
+		{name: "truncated string", input: "04 666f"},
+		{name: "unterminated length", input: "80"},
+	}
+
+	for _, tt := range errorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newDecoder(mustDecodeHex(t, tt.input))
+
+			if got := d.compactString(); got != "" {
+				t.Errorf("compactString() = %q, want \"\" on error", got)
+			}
+			if d.err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
+	}
+}
+
+func TestDecoderCompactArrayLength(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int
+	}{
+		{input: "01", want: 0},
+		{input: "02", want: 1},
+		{input: "7f", want: 126},
+		{input: "8001", want: 127},
+	}
+
+	for _, tt := range tests {
+		d := newDecoder(mustDecodeHex(t, tt.input))
+
+		if got := d.compactArrayLength(); got != tt.want || d.err != nil {
+			t.Errorf("compactArrayLength() of %s = %d (err: %v), want %d", tt.input, got, d.err, tt.want)
+		}
+	}
+
+	errorTests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty input", input: ""},
+		{name: "null array", input: "00"},
+	}
+
+	for _, tt := range errorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newDecoder(mustDecodeHex(t, tt.input))
+
+			if got := d.compactArrayLength(); got != 0 {
+				t.Errorf("compactArrayLength() = %d, want 0 on error", got)
+			}
+			if d.err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
 	}
 }
 

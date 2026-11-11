@@ -41,6 +41,13 @@ func readMessage(r io.Reader) ([]byte, error) {
 	return message, nil
 }
 
+// uuid is a Kafka UUID: 16 bytes, shown as 8-4-4-4-12 hex digits.
+type uuid [16]byte
+
+func (u uuid) String() string {
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
 // requestHeader is a Kafka request header v2.
 type requestHeader struct {
 	apiKey        int16
@@ -91,6 +98,15 @@ func (d *decoder) bytes(n int) []byte {
 	b := d.buf[:n]
 	d.buf = d.buf[n:]
 	return b
+}
+
+// int8 decodes an INT8.
+func (d *decoder) int8() int8 {
+	b := d.bytes(1)
+	if d.err != nil {
+		return 0
+	}
+	return int8(b[0])
 }
 
 // int16 decodes an INT16.
@@ -151,6 +167,42 @@ func (d *decoder) nullableString() *string {
 	return &s
 }
 
+// compactString decodes a COMPACT_STRING: the length of the string + 1 as an
+// UNSIGNED_VARINT, followed by the bytes of the string. A length of 0 stands
+// for null, which a COMPACT_STRING must not be.
+func (d *decoder) compactString() string {
+	n := d.uvarint()
+	if d.err != nil {
+		return ""
+	}
+	if n == 0 {
+		d.err = errors.New("non-nullable string is null")
+		return ""
+	}
+
+	b := d.bytes(int(n - 1))
+	if d.err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// compactArrayLength decodes the length of a COMPACT_ARRAY and returns the
+// number of elements that follow. The length is stored as that number + 1,
+// where 0 stands for a null array, which is reported as an error: none of the
+// arrays that the broker decodes may be null.
+func (d *decoder) compactArrayLength() int {
+	n := d.uvarint()
+	if d.err != nil {
+		return 0
+	}
+	if n == 0 {
+		d.err = errors.New("non-nullable array is null")
+		return 0
+	}
+	return int(n - 1)
+}
+
 // taggedFields skips over a TAG_BUFFER: the number of tagged fields, then for
 // each of them its tag, its size and its data.
 func (d *decoder) taggedFields() {
@@ -162,15 +214,27 @@ func (d *decoder) taggedFields() {
 	}
 }
 
+// Versions of the response header. Which one a response uses depends on the
+// API and on the API version of the request it answers.
+const (
+	// responseHeaderV0 only holds the correlation ID.
+	responseHeaderV0 = 0
+	// responseHeaderV1 holds the correlation ID followed by a TAG_BUFFER.
+	responseHeaderV1 = 1
+)
+
 // encodeResponse builds a Kafka response message: a 4-byte message_size
-// followed by a response header v0, which only holds the correlation ID, and
-// the response body.
-func encodeResponse(correlationID int32, body []byte) []byte {
-	const headerSize = 4
+// followed by a response header of the given version and the response body.
+func encodeResponse(headerVersion int, correlationID int32, body []byte) []byte {
+	var header encoder
+	header.int32(correlationID)
+	if headerVersion >= responseHeaderV1 {
+		header.emptyTaggedFields()
+	}
 
 	var e encoder
-	e.int32(int32(headerSize + len(body))) // message_size
-	e.int32(correlationID)
+	e.int32(int32(len(header.buf) + len(body))) // message_size
+	e.raw(header.buf)
 	e.raw(body)
 
 	return e.buf
@@ -187,6 +251,20 @@ func (e *encoder) raw(b []byte) {
 	e.buf = append(e.buf, b...)
 }
 
+// int8 encodes an INT8.
+func (e *encoder) int8(v int8) {
+	e.buf = append(e.buf, byte(v))
+}
+
+// boolean encodes a BOOLEAN.
+func (e *encoder) boolean(v bool) {
+	if v {
+		e.buf = append(e.buf, 1)
+	} else {
+		e.buf = append(e.buf, 0)
+	}
+}
+
 // int16 encodes an INT16.
 func (e *encoder) int16(v int16) {
 	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(v))
@@ -200,6 +278,18 @@ func (e *encoder) int32(v int32) {
 // uvarint encodes an UNSIGNED_VARINT.
 func (e *encoder) uvarint(v uint32) {
 	e.buf = binary.AppendUvarint(e.buf, uint64(v))
+}
+
+// uuid encodes a UUID.
+func (e *encoder) uuid(v uuid) {
+	e.buf = append(e.buf, v[:]...)
+}
+
+// compactString encodes a COMPACT_STRING: the length of the string + 1 as an
+// UNSIGNED_VARINT, followed by the bytes of the string.
+func (e *encoder) compactString(s string) {
+	e.uvarint(uint32(len(s) + 1))
+	e.buf = append(e.buf, s...)
 }
 
 // compactArrayLength encodes the length of a COMPACT_ARRAY of n elements. It

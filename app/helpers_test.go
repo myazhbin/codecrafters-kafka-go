@@ -77,15 +77,15 @@ func encodeRequest(apiKey, apiVersion int16, correlationID int32, body []byte) [
 	return append(binary.BigEndian.AppendUint32(nil, uint32(len(message))), message...)
 }
 
-// apiVersionsRequest builds the ApiVersions (v4) request that the CodeCrafters
+// newApiVersionsRequest builds the ApiVersions (v4) request that the CodeCrafters
 // tester sends.
-func apiVersionsRequest(correlationID int32) []byte {
-	return apiVersionsRequestWithVersion(4, correlationID)
+func newApiVersionsRequest(correlationID int32) []byte {
+	return newApiVersionsRequestWithVersion(4, correlationID)
 }
 
-// apiVersionsRequestWithVersion builds an ApiVersions request that claims to
+// newApiVersionsRequestWithVersion builds an ApiVersions request that claims to
 // use the given API version.
-func apiVersionsRequestWithVersion(apiVersion int16, correlationID int32) []byte {
+func newApiVersionsRequestWithVersion(apiVersion int16, correlationID int32) []byte {
 	var body []byte
 	body = appendCompactString(body, "kafka-cli") // client_software_name
 	body = appendCompactString(body, "0.1")       // client_software_version
@@ -104,8 +104,20 @@ func appendCompactString(b []byte, s string) []byte {
 // response is a response message split into its parts.
 type response struct {
 	messageSize   int32
-	correlationID int32  // from the response header v0
-	body          []byte // everything after the response header
+	correlationID int32
+	body          []byte // everything after the correlation ID
+}
+
+// bodyAfterHeaderV1 returns the response body of a response that uses response
+// header v1, in which a TAG_BUFFER follows the correlation ID. The test fails
+// if that TAG_BUFFER is missing or not empty.
+func (r response) bodyAfterHeaderV1(t *testing.T) []byte {
+	t.Helper()
+
+	if len(r.body) == 0 || r.body[0] != 0 {
+		t.Fatalf("expected an empty TAG_BUFFER (00) after the correlation ID, got: % x", r.body)
+	}
+	return r.body[1:]
 }
 
 // readResponse reads one response from conn: a 4-byte message_size and the

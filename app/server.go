@@ -22,6 +22,9 @@ func serve(l net.Listener) error {
 
 // handleConnection answers the requests that a client sends over conn, one
 // after the other, until the client disconnects.
+//
+// Like Kafka, the broker closes the connection when it gets a request that it
+// can't parse or that it doesn't support.
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -35,18 +38,48 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		header, err := decodeRequestHeader(newDecoder(message))
+		response, err := handleRequest(message)
 		if err != nil {
-			fmt.Println("Error parsing request header: ", err.Error())
+			fmt.Println("Error handling request: ", err.Error())
 			return
 		}
 
-		// Every request is treated as an ApiVersions request for now.
-		body := handleApiVersions(header)
-
-		if _, err := conn.Write(encodeResponse(header.correlationID, body)); err != nil {
+		if _, err := conn.Write(response); err != nil {
 			fmt.Println("Error writing response: ", err.Error())
 			return
 		}
+	}
+}
+
+// handleRequest builds the response message for a request message (the header
+// and body of a request, without the message_size that precedes them).
+func handleRequest(message []byte) ([]byte, error) {
+	d := newDecoder(message)
+
+	header, err := decodeRequestHeader(d)
+	if err != nil {
+		return nil, fmt.Errorf("parsing request header: %w", err)
+	}
+
+	// ApiVersions is how clients find out what the broker supports, so it is
+	// the one API that answers requests for versions it doesn't support. Its
+	// responses always use response header v0, whatever the request version.
+	if header.apiKey == apiKeyApiVersions {
+		return encodeResponse(responseHeaderV0, header.correlationID, handleApiVersions(header)), nil
+	}
+
+	if !supportsVersion(header.apiKey, header.apiVersion) {
+		return nil, fmt.Errorf("unsupported request: API key %d, version %d", header.apiKey, header.apiVersion)
+	}
+
+	switch header.apiKey {
+	case apiKeyDescribeTopicPartitions:
+		body, err := handleDescribeTopicPartitions(d)
+		if err != nil {
+			return nil, err
+		}
+		return encodeResponse(responseHeaderV1, header.correlationID, body), nil
+	default:
+		return nil, fmt.Errorf("unsupported request: API key %d", header.apiKey)
 	}
 }

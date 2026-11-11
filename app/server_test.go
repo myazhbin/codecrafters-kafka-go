@@ -17,7 +17,7 @@ func TestSendCorrelationID(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
 
-	send(t, conn, apiVersionsRequest(7))
+	send(t, conn, newApiVersionsRequest(7))
 
 	if got := readResponse(t, conn).correlationID; got != 7 {
 		t.Errorf("correlation_id = %d, want 7", got)
@@ -49,7 +49,7 @@ func TestParseCorrelationID(t *testing.T) {
 			addr := startTestServer(t)
 			conn := dial(t, addr)
 
-			send(t, conn, apiVersionsRequest(correlationID))
+			send(t, conn, newApiVersionsRequest(correlationID))
 
 			if got := readResponse(t, conn).correlationID; got != correlationID {
 				t.Errorf("correlation_id = %d, want %d", got, correlationID)
@@ -66,7 +66,7 @@ func TestResponseMessageSize(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
 
-	send(t, conn, apiVersionsRequest(7))
+	send(t, conn, newApiVersionsRequest(7))
 
 	response := readResponse(t, conn)
 	if want := int32(4 + len(response.body)); response.messageSize != want {
@@ -83,7 +83,7 @@ func TestRequestSplitAcrossWrites(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
 
-	request := apiVersionsRequest(1234567890)
+	request := newApiVersionsRequest(1234567890)
 
 	// Cut inside message_size, inside the correlation ID and inside the body.
 	for _, piece := range [][]byte{request[:2], request[2:10], request[10:20], request[20:]} {
@@ -137,7 +137,7 @@ func TestServeAcceptsConsecutiveClients(t *testing.T) {
 	for i := int32(0); i < 3; i++ {
 		conn := dial(t, addr)
 
-		send(t, conn, apiVersionsRequest(100+i))
+		send(t, conn, newApiVersionsRequest(100+i))
 
 		if got := readResponse(t, conn).correlationID; got != 100+i {
 			t.Errorf("client %d: correlation_id = %d, want %d", i, got, 100+i)
@@ -185,7 +185,7 @@ func TestSerialRequests(t *testing.T) {
 	conn := dial(t, addr)
 
 	for _, correlationID := range []int32{1001, 7, 1870644833, -5, 1002} {
-		send(t, conn, apiVersionsRequest(correlationID))
+		send(t, conn, newApiVersionsRequest(correlationID))
 		expectApiVersionsResponse(t, conn, correlationID)
 	}
 
@@ -199,7 +199,7 @@ func TestSerialRequestsWithPauses(t *testing.T) {
 	conn := dial(t, addr)
 
 	for correlationID := int32(1); correlationID <= 3; correlationID++ {
-		send(t, conn, apiVersionsRequest(correlationID))
+		send(t, conn, newApiVersionsRequest(correlationID))
 		expectApiVersionsResponse(t, conn, correlationID)
 
 		time.Sleep(50 * time.Millisecond)
@@ -216,7 +216,7 @@ func TestPipelinedRequests(t *testing.T) {
 
 	var requests []byte
 	for _, correlationID := range correlationIDs {
-		requests = append(requests, apiVersionsRequest(correlationID)...)
+		requests = append(requests, newApiVersionsRequest(correlationID)...)
 	}
 	send(t, conn, requests)
 
@@ -233,7 +233,7 @@ func TestSerialRequestsAfterUnsupportedVersion(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
 
-	send(t, conn, apiVersionsRequestWithVersion(99, 1))
+	send(t, conn, newApiVersionsRequestWithVersion(99, 1))
 
 	response := readResponse(t, conn)
 	if response.correlationID != 1 {
@@ -243,7 +243,7 @@ func TestSerialRequestsAfterUnsupportedVersion(t *testing.T) {
 		t.Errorf("error_code = %d, want 35", got)
 	}
 
-	send(t, conn, apiVersionsRequest(2))
+	send(t, conn, newApiVersionsRequest(2))
 	expectApiVersionsResponse(t, conn, 2)
 }
 
@@ -257,7 +257,7 @@ func TestServeAcceptsClientAfterSerialRequests(t *testing.T) {
 		for request := int32(0); request < 3; request++ {
 			correlationID := client*10 + request
 
-			send(t, conn, apiVersionsRequest(correlationID))
+			send(t, conn, newApiVersionsRequest(correlationID))
 			expectApiVersionsResponse(t, conn, correlationID)
 		}
 
@@ -277,7 +277,7 @@ func TestConcurrentClients(t *testing.T) {
 		for client, conn := range conns {
 			correlationID := int32(client)*100 + round
 
-			send(t, conn, apiVersionsRequest(correlationID))
+			send(t, conn, newApiVersionsRequest(correlationID))
 			expectApiVersionsResponse(t, conn, correlationID)
 		}
 	}
@@ -286,7 +286,7 @@ func TestConcurrentClients(t *testing.T) {
 	for client := len(conns) - 1; client >= 0; client-- {
 		correlationID := int32(client)*100 + 99
 
-		send(t, conns[client], apiVersionsRequest(correlationID))
+		send(t, conns[client], newApiVersionsRequest(correlationID))
 		expectApiVersionsResponse(t, conns[client], correlationID)
 	}
 }
@@ -299,7 +299,7 @@ func TestConcurrentClientsReadAfterAllRequestsAreSent(t *testing.T) {
 	conns := []net.Conn{dial(t, addr), dial(t, addr), dial(t, addr)}
 
 	for client, conn := range conns {
-		send(t, conn, apiVersionsRequest(int32(client)+1))
+		send(t, conn, newApiVersionsRequest(int32(client)+1))
 	}
 	for client, conn := range conns {
 		expectApiVersionsResponse(t, conn, int32(client)+1)
@@ -314,11 +314,11 @@ func TestIdleClientDoesNotBlockOthers(t *testing.T) {
 	idle := dial(t, addr)
 
 	active := dial(t, addr)
-	send(t, active, apiVersionsRequest(1))
+	send(t, active, newApiVersionsRequest(1))
 	expectApiVersionsResponse(t, active, 1)
 
 	// The idle client is still connected and gets served once it speaks up.
-	send(t, idle, apiVersionsRequest(2))
+	send(t, idle, newApiVersionsRequest(2))
 	expectApiVersionsResponse(t, idle, 2)
 }
 
@@ -360,7 +360,7 @@ func TestConcurrentClientsInParallel(t *testing.T) {
 				for request := int32(0); request < requestsPerClient; request++ {
 					correlationID := client*1000 + request
 
-					send(t, conn, apiVersionsRequest(correlationID))
+					send(t, conn, newApiVersionsRequest(correlationID))
 					expectApiVersionsResponse(t, conn, correlationID)
 				}
 			})
