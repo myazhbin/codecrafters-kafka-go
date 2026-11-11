@@ -2,6 +2,7 @@ package main
 
 // API keys of the Kafka protocol.
 const (
+	apiKeyFetch                   int16 = 1
 	apiKeyApiVersions             int16 = 18
 	apiKeyDescribeTopicPartitions int16 = 75
 )
@@ -23,6 +24,7 @@ type apiVersionRange struct {
 // supportedAPIs lists the APIs that the broker supports. It is what the broker
 // advertises in its ApiVersions responses.
 var supportedAPIs = []apiVersionRange{
+	{apiKey: apiKeyFetch, minVersion: 16, maxVersion: 16},
 	{apiKey: apiKeyApiVersions, minVersion: 0, maxVersion: 4},
 	{apiKey: apiKeyDescribeTopicPartitions, minVersion: 0, maxVersion: 0},
 }

@@ -206,6 +206,11 @@ func TestSupportedAPIs(t *testing.T) {
 		t.Errorf("ApiVersions entry = %+v, want %+v", got, want)
 	}
 
+	// The broker supports version 16 of Fetch.
+	if got, want := findAPI(t, supportedAPIs, 1), (apiVersionRange{apiKey: 1, minVersion: 16, maxVersion: 16}); got != want {
+		t.Errorf("Fetch entry = %+v, want %+v", got, want)
+	}
+
 	// The broker supports version 0 of DescribeTopicPartitions.
 	if got, want := findAPI(t, supportedAPIs, 75), (apiVersionRange{apiKey: 75, minVersion: 0, maxVersion: 0}); got != want {
 		t.Errorf("DescribeTopicPartitions entry = %+v, want %+v", got, want)
@@ -222,6 +227,11 @@ func TestSupportsVersion(t *testing.T) {
 		{apiKey: 18, apiVersion: 0, want: true},
 		{apiKey: 18, apiVersion: 4, want: true},
 		{apiKey: 18, apiVersion: 5, want: false},
+
+		{apiKey: 1, apiVersion: 0, want: false},
+		{apiKey: 1, apiVersion: 15, want: false},
+		{apiKey: 1, apiVersion: 16, want: true},
+		{apiKey: 1, apiVersion: 17, want: false},
 
 		{apiKey: 75, apiVersion: -1, want: false},
 		{apiKey: 75, apiVersion: 0, want: true},
@@ -394,6 +404,49 @@ func TestApiVersionsIncludesDescribeTopicPartitions(t *testing.T) {
 
 	// API key 75 (DescribeTopicPartitions): min_version 0, max_version at
 	// least 0.
+	if api := findAPI(t, body.apiKeys, 75); api.minVersion != 0 || api.maxVersion < 0 {
+		t.Errorf("DescribeTopicPartitions entry = %+v, want min_version 0 and max_version >= 0", api)
+	}
+
+	expectNoMoreData(t, conn)
+}
+
+// Stage gs0: the ApiVersions response advertises the Fetch API.
+func TestApiVersionsIncludesFetch(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	send(t, conn, newApiVersionsRequest(1737034428))
+
+	response := readResponse(t, conn)
+
+	// The message length is valid.
+	if want := int32(4 + len(response.body)); response.messageSize != want {
+		t.Errorf("message_size = %d, want %d", response.messageSize, want)
+	}
+
+	// The correlation ID matches the one in the request header.
+	if response.correlationID != 1737034428 {
+		t.Errorf("correlation_id = %d, want 1737034428", response.correlationID)
+	}
+
+	// The error code is 0 (No Error).
+	body := decodeApiVersionsResponse(t, response.body)
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+
+	// The body has an entry for the API key 1 (Fetch) whose MaxVersion is at
+	// least 16. Version 16 is the one that clients are expected to use, so it
+	// has to be in the advertised range.
+	if api := findAPI(t, body.apiKeys, 1); api.maxVersion < 16 || api.minVersion > 16 || api.minVersion < 0 {
+		t.Errorf("Fetch entry = %+v, want a range that includes version 16", api)
+	}
+
+	// The entries of the previous stages are still there.
+	if api := findAPI(t, body.apiKeys, 18); api.minVersion != 0 || api.maxVersion < 4 {
+		t.Errorf("ApiVersions entry = %+v, want min_version 0 and max_version >= 4", api)
+	}
 	if api := findAPI(t, body.apiKeys, 75); api.minVersion != 0 || api.maxVersion < 0 {
 		t.Errorf("DescribeTopicPartitions entry = %+v, want min_version 0 and max_version >= 0", api)
 	}
