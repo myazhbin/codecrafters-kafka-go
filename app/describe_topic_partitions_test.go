@@ -598,6 +598,100 @@ func TestDescribeTopicWithSinglePartition(t *testing.T) {
 	})
 }
 
+// Stage ku4: a topic with several partitions is described with one entry per
+// partition, each with its own partition index.
+func TestDescribeTopicWithMultiplePartitions(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "one", id: testTopicID(0x10), partitions: []int32{0}},
+		testTopic{name: "two", id: testTopicID(0x20), partitions: []int32{0, 1}},
+		testTopic{name: "three", id: testTopicID(0x30), partitions: []int32{0, 1, 2}},
+		testTopic{name: "unordered", id: testTopicID(0x40), partitions: []int32{3, 1, 0, 2}},
+		testTopic{name: "none", id: testTopicID(0x50)},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	tests := []struct {
+		topic      string
+		id         uuid
+		partitions []int32
+	}{
+		{topic: "two", id: testTopicID(0x20), partitions: []int32{0, 1}},
+		{topic: "three", id: testTopicID(0x30), partitions: []int32{0, 1, 2}},
+
+		// Partitions are listed by index, whatever their order in the log.
+		{topic: "unordered", id: testTopicID(0x40), partitions: []int32{0, 1, 2, 3}},
+
+		// The neighbours of the topics above keep their own partitions.
+		{topic: "one", id: testTopicID(0x10), partitions: []int32{0}},
+		{topic: "none", id: testTopicID(0x50), partitions: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.topic, func(t *testing.T) {
+			body := describeTopics(t, addr, tt.topic)
+
+			if len(body.topics) != 1 {
+				t.Fatalf("got %d topics, want 1", len(body.topics))
+			}
+			expectKnownTopic(t, body.topics[0], tt.topic, tt.id, tt.partitions...)
+		})
+	}
+
+	t.Run("response bytes", func(t *testing.T) {
+		conn := dial(t, addr)
+		send(t, conn, newDescribeTopicPartitionsRequest(7, "two"))
+
+		want := "00000061" + // message_size: 97 bytes
+			"00000007" + // correlation_id
+			"00" + // TAG_BUFFER: empty (response header v1)
+			"00000000" + // throttle_time_ms: 0
+			"02" + // topics array: 1 element
+			"0000" + // error_code: 0 (no error)
+			"0474776f" + // name: "two"
+			"00000000000040008000000000000020" + // topic_id
+			"00" + // is_internal: false
+			"03" + // partitions array: 2 elements
+
+			"0000" + // error_code: 0 (no error)
+			"00000000" + // partition_index: 0
+			"00000001" + // leader_id: 1
+			"00000000" + // leader_epoch: 0
+			"0200000001" + // replica_nodes: broker 1
+			"0200000001" + // isr_nodes: broker 1
+			"01" + // eligible_leader_replicas: empty
+			"01" + // last_known_elr: empty
+			"01" + // offline_replicas: empty
+			"00" + // TAG_BUFFER: empty
+
+			"0000" + // error_code: 0 (no error)
+			"00000001" + // partition_index: 1
+			"00000001" + // leader_id: 1
+			"00000000" + // leader_epoch: 0
+			"0200000001" + // replica_nodes: broker 1
+			"0200000001" + // isr_nodes: broker 1
+			"01" + // eligible_leader_replicas: empty
+			"01" + // last_known_elr: empty
+			"01" + // offline_replicas: empty
+			"00" + // TAG_BUFFER: empty
+
+			"00000000" + // topic_authorized_operations: 0
+			"00" + // TAG_BUFFER: empty
+			"ff" + // next_cursor: -1 (null)
+			"00" // TAG_BUFFER: empty
+
+		got := make([]byte, len(want)/2)
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("failed to read response: %v", err)
+		}
+		if !bytes.Equal(got, mustDecodeHex(t, want)) {
+			t.Errorf("response = % x, want % x", got, mustDecodeHex(t, want))
+		}
+
+		expectNoMoreData(t, conn)
+	})
+}
+
 // The cluster metadata log of the CodeCrafters tester, as documented in the
 // protocol inspector linked from the stage instructions.
 func TestDescribeTopicOfCodeCraftersLog(t *testing.T) {
