@@ -206,6 +206,11 @@ func TestSupportedAPIs(t *testing.T) {
 		t.Errorf("ApiVersions entry = %+v, want %+v", got, want)
 	}
 
+	// The broker supports version 11 of Produce.
+	if got, want := findAPI(t, supportedAPIs, 0), (apiVersionRange{apiKey: 0, minVersion: 11, maxVersion: 11}); got != want {
+		t.Errorf("Produce entry = %+v, want %+v", got, want)
+	}
+
 	// The broker supports version 16 of Fetch.
 	if got, want := findAPI(t, supportedAPIs, 1), (apiVersionRange{apiKey: 1, minVersion: 16, maxVersion: 16}); got != want {
 		t.Errorf("Fetch entry = %+v, want %+v", got, want)
@@ -227,6 +232,11 @@ func TestSupportsVersion(t *testing.T) {
 		{apiKey: 18, apiVersion: 0, want: true},
 		{apiKey: 18, apiVersion: 4, want: true},
 		{apiKey: 18, apiVersion: 5, want: false},
+
+		{apiKey: 0, apiVersion: 0, want: false},
+		{apiKey: 0, apiVersion: 10, want: false},
+		{apiKey: 0, apiVersion: 11, want: true},
+		{apiKey: 0, apiVersion: 12, want: false},
 
 		{apiKey: 1, apiVersion: 0, want: false},
 		{apiKey: 1, apiVersion: 15, want: false},
@@ -449,6 +459,52 @@ func TestApiVersionsIncludesFetch(t *testing.T) {
 	}
 	if api := findAPI(t, body.apiKeys, 75); api.minVersion != 0 || api.maxVersion < 0 {
 		t.Errorf("DescribeTopicPartitions entry = %+v, want min_version 0 and max_version >= 0", api)
+	}
+
+	expectNoMoreData(t, conn)
+}
+
+// Stage xz1: the ApiVersions response advertises the Produce API.
+func TestApiVersionsIncludesProduce(t *testing.T) {
+	addr := startTestServer(t)
+	conn := dial(t, addr)
+
+	send(t, conn, newApiVersionsRequest(1737034428))
+
+	response := readResponse(t, conn)
+
+	// The message length is valid.
+	if want := int32(4 + len(response.body)); response.messageSize != want {
+		t.Errorf("message_size = %d, want %d", response.messageSize, want)
+	}
+
+	// The correlation ID matches the one in the request header.
+	if response.correlationID != 1737034428 {
+		t.Errorf("correlation_id = %d, want 1737034428", response.correlationID)
+	}
+
+	// The error code is 0 (NO_ERROR).
+	body := decodeApiVersionsResponse(t, response.body)
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+
+	// The body has an entry for the API key 0 (Produce) whose MaxVersion is
+	// at least 11. Version 11 is the one that clients are expected to use, so
+	// it has to be in the advertised range.
+	if api := findAPI(t, body.apiKeys, 0); api.maxVersion < 11 || api.minVersion > 11 || api.minVersion < 0 {
+		t.Errorf("Produce entry = %+v, want a range that includes version 11", api)
+	}
+
+	// The entries of the previous stages are still there.
+	if api := findAPI(t, body.apiKeys, 18); api.minVersion != 0 || api.maxVersion < 4 {
+		t.Errorf("ApiVersions entry = %+v, want min_version 0 and max_version >= 4", api)
+	}
+	if api := findAPI(t, body.apiKeys, 75); api.minVersion != 0 || api.maxVersion < 0 {
+		t.Errorf("DescribeTopicPartitions entry = %+v, want min_version 0 and max_version >= 0", api)
+	}
+	if api := findAPI(t, body.apiKeys, 1); api.maxVersion < 16 || api.minVersion > 16 {
+		t.Errorf("Fetch entry = %+v, want a range that includes version 16", api)
 	}
 
 	expectNoMoreData(t, conn)
