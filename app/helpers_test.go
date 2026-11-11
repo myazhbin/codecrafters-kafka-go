@@ -176,6 +176,22 @@ func expectNoMoreData(t *testing.T, conn net.Conn) {
 	}
 }
 
+// expectConnectionClosed fails the test unless the broker closes conn without
+// sending anything. Depending on timing, a connection closed by the broker
+// shows up as EOF or as a reset.
+func expectConnectionClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+
+	response := make([]byte, 64)
+	n, err := conn.Read(response)
+	if n > 0 {
+		t.Fatalf("expected no response, got % x", response[:n])
+	}
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected the connection to be closed, got error: %v", err)
+	}
+}
+
 // mustDecodeHex decodes a hex string, ignoring any whitespace in it.
 func mustDecodeHex(t *testing.T, s string) []byte {
 	t.Helper()

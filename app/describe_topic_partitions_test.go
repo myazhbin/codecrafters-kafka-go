@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"io"
-	"os"
 	"reflect"
 	"testing"
 )
@@ -829,14 +827,7 @@ func TestDescribeTopicWithCorruptMetadataLog(t *testing.T) {
 	conn := dial(t, addr)
 	send(t, conn, newDescribeTopicPartitionsRequest(1, "saz"))
 
-	response := make([]byte, 64)
-	n, err := conn.Read(response)
-	if n > 0 {
-		t.Fatalf("expected no response, got % x", response[:n])
-	}
-	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("expected the connection to be closed, got error: %v", err)
-	}
+	expectConnectionClosed(t, conn)
 }
 
 // ApiVersions and DescribeTopicPartitions requests can be mixed on the same
@@ -902,14 +893,7 @@ func TestUnsupportedRequestClosesConnection(t *testing.T) {
 
 			send(t, conn, tt.request)
 
-			response := make([]byte, 64)
-			n, err := conn.Read(response)
-			if n > 0 {
-				t.Fatalf("expected no response, got % x", response[:n])
-			}
-			if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-				t.Fatalf("expected the connection to be closed, got error: %v", err)
-			}
+			expectConnectionClosed(t, conn)
 		})
 	}
 }

@@ -1,11 +1,9 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"net"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -116,16 +114,7 @@ func TestMalformedRequestClosesConnection(t *testing.T) {
 
 			send(t, conn, mustDecodeHex(t, tt.request))
 
-			// The connection must be closed without a single byte being sent.
-			// Depending on timing that shows up as EOF or as a reset.
-			response := make([]byte, 64)
-			n, err := conn.Read(response)
-			if n > 0 {
-				t.Fatalf("expected no response, got % x", response[:n])
-			}
-			if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-				t.Fatalf("expected the connection to be closed, got error: %v", err)
-			}
+			expectConnectionClosed(t, conn)
 		})
 	}
 }

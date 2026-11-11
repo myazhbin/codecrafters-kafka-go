@@ -82,14 +82,20 @@ func (b *broker) handleRequest(message []byte) ([]byte, error) {
 		return nil, fmt.Errorf("unsupported request: API key %d, version %d", header.apiKey, header.apiVersion)
 	}
 
+	var body []byte
 	switch header.apiKey {
+	case apiKeyFetch:
+		body, err = b.handleFetch(d)
 	case apiKeyDescribeTopicPartitions:
-		body, err := b.handleDescribeTopicPartitions(d)
-		if err != nil {
-			return nil, err
-		}
-		return encodeResponse(responseHeaderV1, header.correlationID, body), nil
+		body, err = b.handleDescribeTopicPartitions(d)
 	default:
-		return nil, fmt.Errorf("unsupported request: API key %d", header.apiKey)
+		err = fmt.Errorf("unsupported request: API key %d", header.apiKey)
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	// The versions of these APIs that the broker supports are all "flexible"
+	// versions, whose responses use response header v1.
+	return encodeResponse(responseHeaderV1, header.correlationID, body), nil
 }
