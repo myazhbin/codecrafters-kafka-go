@@ -5,7 +5,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -532,6 +535,440 @@ func TestProduceToValidTopicAndPartition(t *testing.T) {
 				t.Errorf("partition response = %+v, want %+v", got, want)
 			}
 		})
+	}
+}
+
+// helloBatch builds a record batch like the ones that the CodeCrafters tester
+// produces: its records have the given values, and its base offset is 0, as
+// it is for all the batches that producers send.
+func helloBatch(values ...string) []byte {
+	batch := testBatch{timestamp: 1726045973899}
+	for _, value := range values {
+		batch.values = append(batch.values, []byte(value))
+	}
+	return encodeRecordBatch(batch)
+}
+
+// expectProduced checks that the response to a Produce request says that the
+// records of the request were added to a single partition, at the given
+// offset.
+func expectProduced(t *testing.T, body produceResponse, topic string, partition int32, baseOffset int64) {
+	t.Helper()
+
+	if len(body.topics) != 1 {
+		t.Fatalf("topics has %d elements, want 1", len(body.topics))
+	}
+	if body.topics[0].name != topic {
+		t.Errorf("name = %q, want %q", body.topics[0].name, topic)
+	}
+	if len(body.topics[0].partitions) != 1 {
+		t.Fatalf("partitions has %d elements, want 1", len(body.topics[0].partitions))
+	}
+
+	want := producedPartition{
+		index:           partition,
+		errorCode:       0,
+		baseOffset:      baseOffset,
+		logAppendTimeMs: -1,
+		logStartOffset:  0,
+	}
+	if got := body.topics[0].partitions[0]; !reflect.DeepEqual(got, want) {
+		t.Errorf("partition response = %+v, want %+v", got, want)
+	}
+}
+
+// Stage ls8: the record of a Produce request is persisted to the log file of
+// its partition, in the record batch format.
+func TestProduceSingleRecord(t *testing.T) {
+	// The log of the partition may not exist yet, or be an empty file.
+	logSetups := map[string]func(t *testing.T, logDir string){
+		"no log file": func(t *testing.T, logDir string) {},
+		"empty log file": func(t *testing.T, logDir string) {
+			writeLogSegment(t, logDir, "foo", 0, nil)
+		},
+	}
+
+	for name, setUpLog := range logSetups {
+		t.Run(name, func(t *testing.T) {
+			logDir := t.TempDir()
+			writeClusterMetadataLog(t, logDir,
+				testTopic{name: "bar", id: testTopicID(1), partitions: []int32{0}},
+				testTopic{name: "foo", id: testTopicID(2), partitions: []int32{0}},
+			)
+			setUpLog(t, logDir)
+			addr := startTestServerWithLogDir(t, logDir)
+
+			batch := helloBatch("Hello World!")
+
+			body := produce(t, addr, produceTopic{
+				name:       "foo",
+				partitions: []producePartition{{index: 0, records: batch}},
+			})
+
+			// The error_code is 0, the base_offset is 0 (this is the first
+			// record in the partition), the log_append_time_ms is -1 and the
+			// log_start_offset is 0.
+			expectProduced(t, body, "foo", 0, 0)
+
+			// The record is persisted to the log file of the partition, at
+			// <log-dir>/<topic-name>-<partition-index>/00000000000000000000.log,
+			// as the record batch of the request.
+			if got := readLogSegment(t, logDir, "foo", 0); !bytes.Equal(got, batch) {
+				t.Errorf("log file = % x, want the record batch of the request: % x", got, batch)
+			}
+
+			// Nothing else was written to the log directory.
+			if entries := listDir(t, logDir); !reflect.DeepEqual(entries, []string{"__cluster_metadata-0", "foo-0"}) {
+				t.Errorf("log directory contains %q, want only the metadata log and the log of foo-0", entries)
+			}
+			if entries := listDir(t, filepath.Join(logDir, "foo-0")); !reflect.DeepEqual(entries, []string{"00000000000000000000.log"}) {
+				t.Errorf("partition directory contains %q, want a single segment", entries)
+			}
+		})
+	}
+}
+
+// listDir returns the names of the entries of a directory, sorted.
+func listDir(t *testing.T, dir string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to list directory: %v", err)
+	}
+
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
+}
+
+// Records that were produced can be fetched: the batch that Fetch returns is
+// the one that Produce stored.
+func TestProduceThenFetch(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	addr := startTestServerWithLogDir(t, logDir)
+
+	batch := helloBatch("Hello World!")
+	expectProduced(t, produce(t, addr, produceTopic{
+		name:       "foo",
+		partitions: []producePartition{{index: 0, records: batch}},
+	}), "foo", 0, 0)
+
+	body := fetch(t, addr, fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 0}}})
+
+	if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+		t.Fatalf("unexpected Fetch response: %+v", body)
+	}
+	partition := body.topics[0].partitions[0]
+	if partition.errorCode != 0 || partition.highWatermark != 1 {
+		t.Errorf("fetched partition: error_code = %d, high_watermark = %d; want 0, 1", partition.errorCode, partition.highWatermark)
+	}
+	if !bytes.Equal(partition.records, batch) {
+		t.Errorf("fetched records = % x, want the produced batch: % x", partition.records, batch)
+	}
+	if got, want := fetchedValues(t, partition), [][]string{{"Hello World!"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("fetched messages = %q, want %q", got, want)
+	}
+}
+
+// Records are appended to the log of their partition: they get the offsets
+// that follow the ones of the records that are already there.
+func TestProduceAppendsToLog(t *testing.T) {
+	t.Run("consecutive requests", func(t *testing.T) {
+		logDir := t.TempDir()
+		writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+		addr := startTestServerWithLogDir(t, logDir)
+
+		messages := []string{"Hello Earth!", "Hello World!", "Hello Kafka!"}
+		for offset, message := range messages {
+			body := produce(t, addr, produceTopic{
+				name:       "foo",
+				partitions: []producePartition{{index: 0, records: helloBatch(message)}},
+			})
+			expectProduced(t, body, "foo", 0, int64(offset))
+		}
+
+		batches, err := decodeRecordBatches(readLogSegment(t, logDir, "foo", 0))
+		if err != nil {
+			t.Fatalf("the log file is not a sequence of record batches: %v", err)
+		}
+		if len(batches) != len(messages) {
+			t.Fatalf("the log file holds %d batches, want %d", len(batches), len(messages))
+		}
+		for offset, message := range messages {
+			batch := batches[offset]
+
+			// The batch got the next offset of the log...
+			if batch.baseOffset != int64(offset) {
+				t.Errorf("batch %d: base offset = %d, want %d", offset, batch.baseOffset, offset)
+			}
+			// ... and is otherwise stored as the producer sent it.
+			if sent := helloBatch(message); !bytes.Equal(batch.raw[8:], sent[8:]) {
+				t.Errorf("batch %d = % x, want % x after its base offset", offset, batch.raw[8:], sent[8:])
+			}
+			if records := mustDecodeRecords(t, batch); len(records) != 1 || string(records[0].value) != message {
+				t.Errorf("batch %d holds the records %+v, want a single record with the value %q", offset, records, message)
+			}
+		}
+	})
+
+	t.Run("log that already holds records", func(t *testing.T) {
+		existing := encodeRecordBatch(testBatch{baseOffset: 0, values: [][]byte{[]byte("a"), []byte("b"), []byte("c")}})
+
+		logDir := t.TempDir()
+		writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+		writeLogSegment(t, logDir, "foo", 0, existing)
+		addr := startTestServerWithLogDir(t, logDir)
+
+		body := produce(t, addr, produceTopic{
+			name:       "foo",
+			partitions: []producePartition{{index: 0, records: helloBatch("d")}},
+		})
+		expectProduced(t, body, "foo", 0, 3)
+
+		// The records that were there are untouched; the new batch follows
+		// them, with the offset 3.
+		log := readLogSegment(t, logDir, "foo", 0)
+		if !bytes.HasPrefix(log, existing) {
+			t.Fatalf("the log file no longer starts with the records that it held")
+		}
+		batches, err := decodeRecordBatches(log)
+		if err != nil {
+			t.Fatalf("the log file is not a sequence of record batches: %v", err)
+		}
+		if len(batches) != 2 || batches[1].baseOffset != 3 || batches[1].lastOffset() != 3 {
+			t.Errorf("unexpected batches in the log file: %+v", batches)
+		}
+	})
+
+	t.Run("several batches in one request", func(t *testing.T) {
+		logDir := t.TempDir()
+		writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+		addr := startTestServerWithLogDir(t, logDir)
+
+		records := append(helloBatch("a", "b"), helloBatch("c")...)
+		body := produce(t, addr, produceTopic{
+			name:       "foo",
+			partitions: []producePartition{{index: 0, records: records}},
+		})
+		expectProduced(t, body, "foo", 0, 0)
+
+		batches, err := decodeRecordBatches(readLogSegment(t, logDir, "foo", 0))
+		if err != nil {
+			t.Fatalf("the log file is not a sequence of record batches: %v", err)
+		}
+		if len(batches) != 2 || batches[0].baseOffset != 0 || batches[0].lastOffset() != 1 || batches[1].baseOffset != 2 {
+			t.Errorf("unexpected batches in the log file: %+v", batches)
+		}
+
+		// The next request continues after the last record.
+		body = produce(t, addr, produceTopic{
+			name:       "foo",
+			partitions: []producePartition{{index: 0, records: helloBatch("d")}},
+		})
+		expectProduced(t, body, "foo", 0, 3)
+	})
+}
+
+// Records that are not valid record batches are rejected with the error code
+// INVALID_RECORD (87), and leave the log of the partition as it was.
+func TestProduceInvalidRecords(t *testing.T) {
+	valid := helloBatch("Hello World!")
+
+	// withByte returns a copy of the valid batch in which one byte is changed.
+	withByte := func(offset int, value byte) []byte {
+		b := bytes.Clone(valid)
+		b[offset] = value
+		return b
+	}
+
+	tests := []struct {
+		name    string
+		records []byte
+	}{
+		{name: "null records", records: nil},
+		{name: "empty records", records: []byte{}},
+		{name: "garbage", records: []byte("these are not record batches")},
+		{name: "truncated batch", records: valid[:len(valid)-3]},
+		{name: "trailing bytes", records: append(bytes.Clone(valid), 0x00, 0x01)},
+		{name: "unsupported magic", records: withByte(16, 1)},
+		{name: "control batch", records: withByte(22, 0x20)},
+		{name: "last offset delta that doesn't match the record count", records: withByte(26, 5)},
+		{name: "negative last offset delta", records: withByte(23, 0xff)},
+		{name: "more records announced than present", records: withByte(60, 2)},
+		{name: "corrupt record", records: withByte(61, 0x7e)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logDir := t.TempDir()
+			writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+			writeLogSegment(t, logDir, "foo", 0, valid)
+			addr := startTestServerWithLogDir(t, logDir)
+
+			body := produce(t, addr, produceTopic{
+				name:       "foo",
+				partitions: []producePartition{{index: 0, records: tt.records}},
+			})
+
+			if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+				t.Fatalf("unexpected response: %+v", body)
+			}
+			expectProduceError(t, body.topics[0].partitions[0], 0, 87)
+
+			if got := readLogSegment(t, logDir, "foo", 0); !bytes.Equal(got, valid) {
+				t.Errorf("the log file changed: % x, want % x", got, valid)
+			}
+		})
+	}
+}
+
+// Records for a topic or a partition that doesn't exist are not stored.
+func TestProduceToUnknownPartitionWritesNothing(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := produce(t, addr,
+		produceTopic{name: "foo", partitions: []producePartition{{index: 1, records: helloBatch("lost")}}},
+		produceTopic{name: "nope", partitions: []producePartition{{index: 0, records: helloBatch("lost")}}},
+	)
+
+	if len(body.topics) != 2 || len(body.topics[0].partitions) != 1 || len(body.topics[1].partitions) != 1 {
+		t.Fatalf("unexpected response: %+v", body)
+	}
+	expectProduceError(t, body.topics[0].partitions[0], 1, 3)
+	expectProduceError(t, body.topics[1].partitions[0], 0, 3)
+
+	if entries := listDir(t, logDir); !reflect.DeepEqual(entries, []string{"__cluster_metadata-0"}) {
+		t.Errorf("log directory contains %q, want only the metadata log", entries)
+	}
+}
+
+// A partition whose log can't be written to is reported with the error code
+// KAFKA_STORAGE_ERROR (56).
+func TestProduceToUnwritableLog(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0, 1}})
+
+	// The log of partition 0 is corrupt, and a file is in the way of the
+	// directory of partition 1.
+	writeLogSegment(t, logDir, "foo", 0, []byte{0x00, 0x01, 0x02})
+	writeFile(t, filepath.Join(logDir, "foo-1"), []byte("not a directory"))
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := produce(t, addr, produceTopic{name: "foo", partitions: []producePartition{
+		{index: 0, records: helloBatch("lost")},
+		{index: 1, records: helloBatch("lost")},
+	}})
+
+	if len(body.topics) != 1 || len(body.topics[0].partitions) != 2 {
+		t.Fatalf("unexpected response: %+v", body)
+	}
+	expectProduceError(t, body.topics[0].partitions[0], 0, 56)
+	expectProduceError(t, body.topics[0].partitions[1], 1, 56)
+}
+
+// Producers that write to the same partition at the same time each get their
+// own offsets, and none of their records is lost or damaged. Run with -race,
+// this also checks that producing and fetching concurrently is free of data
+// races.
+func TestConcurrentProducers(t *testing.T) {
+	const (
+		producers         = 8
+		recordsPerRequest = 3
+		requests          = 5
+	)
+
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	addr := startTestServerWithLogDir(t, logDir)
+
+	var mu sync.Mutex
+	baseOffsets := map[int64]bool{}
+
+	t.Run("group", func(t *testing.T) {
+		for producer := 0; producer < producers; producer++ {
+			t.Run(fmt.Sprintf("producer %d", producer), func(t *testing.T) {
+				t.Parallel()
+
+				conn := dial(t, addr)
+				for request := int32(0); request < requests; request++ {
+					var values []string
+					for record := 0; record < recordsPerRequest; record++ {
+						values = append(values, fmt.Sprintf("producer %d, request %d, record %d", producer, request, record))
+					}
+
+					send(t, conn, newProduceRequest(request, produceTopic{
+						name:       "foo",
+						partitions: []producePartition{{index: 0, records: helloBatch(values...)}},
+					}))
+					body := expectProduceResponse(t, conn, request)
+
+					if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 || body.topics[0].partitions[0].errorCode != 0 {
+						t.Fatalf("unexpected response: %+v", body)
+					}
+
+					mu.Lock()
+					baseOffsets[body.topics[0].partitions[0].baseOffset] = true
+					mu.Unlock()
+				}
+			})
+		}
+
+		// Meanwhile, a consumer keeps reading the partition: it must never
+		// see a batch that is only partly written.
+		t.Run("consumer", func(t *testing.T) {
+			t.Parallel()
+
+			for i := 0; i < 20; i++ {
+				body := fetch(t, addr, fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 0}}})
+				if len(body.topics) != 1 || len(body.topics[0].partitions) != 1 {
+					t.Fatalf("unexpected Fetch response: %+v", body)
+				}
+				if partition := body.topics[0].partitions[0]; partition.errorCode != 0 {
+					t.Fatalf("fetch failed with the error code %d", partition.errorCode)
+				} else if _, err := decodeRecordBatches(partition.records); err != nil {
+					t.Fatalf("fetched records are not whole record batches: %v", err)
+				}
+			}
+		})
+	})
+
+	// Every request got a base offset of its own: 0, 3, 6, ...
+	const totalRequests = producers * requests
+	if len(baseOffsets) != totalRequests {
+		t.Errorf("got %d distinct base offsets, want %d", len(baseOffsets), totalRequests)
+	}
+	for i := int64(0); i < totalRequests; i++ {
+		if !baseOffsets[i*recordsPerRequest] {
+			t.Errorf("no request got the base offset %d", i*recordsPerRequest)
+		}
+	}
+
+	// The log holds all the batches, with consecutive offsets and intact
+	// records.
+	batches, err := decodeRecordBatches(readLogSegment(t, logDir, "foo", 0))
+	if err != nil {
+		t.Fatalf("the log file is not a sequence of record batches: %v", err)
+	}
+	if len(batches) != totalRequests {
+		t.Fatalf("the log file holds %d batches, want %d", len(batches), totalRequests)
+	}
+	seen := map[string]bool{}
+	for i, batch := range batches {
+		if want := int64(i * recordsPerRequest); batch.baseOffset != want {
+			t.Errorf("batch %d: base offset = %d, want %d", i, batch.baseOffset, want)
+		}
+		for _, record := range mustDecodeRecords(t, batch) {
+			seen[string(record.value)] = true
+		}
+	}
+	if want := totalRequests * recordsPerRequest; len(seen) != want {
+		t.Errorf("the log file holds %d distinct records, want %d", len(seen), want)
 	}
 }
 

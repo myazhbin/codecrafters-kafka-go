@@ -137,12 +137,15 @@ func (b *broker) handleProduce(d *decoder) ([]byte, error) {
 		return nil, err
 	}
 
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
+
 	failed := false
 	topics := make([]produceTopicResponse, 0, len(request.topics))
 	for _, topic := range request.topics {
 		response := produceTopicResponse{name: topic.name}
 		for _, partition := range topic.partitions {
-			partitionResponse := produceToPartition(metadata, topic.name, partition)
+			partitionResponse := b.produceToPartition(metadata, topic.name, partition)
 			if partitionResponse.errorCode != errorCodeNone {
 				failed = true
 			}
@@ -162,14 +165,49 @@ func (b *broker) handleProduce(d *decoder) ([]byte, error) {
 }
 
 // produceToPartition answers the part of a Produce request that is about one
-// partition of the topic with the given name.
-func produceToPartition(metadata *clusterMetadata, topicName string, partition producePartition) producePartitionResponse {
+// partition of the topic with the given name: it appends the record batches
+// of the request to the log of the partition on disk.
+func (b *broker) produceToPartition(metadata *clusterMetadata, topicName string, partition producePartition) producePartitionResponse {
 	topic, ok := metadata.topicsByName[topicName]
 	if !ok || !topic.hasPartition(partition.index) {
 		return produceError(partition.index, errorCodeUnknownTopicOrPartition)
 	}
 
-	// The broker doesn't store records yet: it answers as if the records of
-	// the request were the first ones of the partition, at the offset 0.
-	return producePartitionResponse{index: partition.index}
+	batches, err := decodeProducedBatches(partition.records)
+	if err != nil {
+		fmt.Printf("Invalid records for partition %d of topic %s: %v\n", partition.index, topicName, err)
+		return produceError(partition.index, errorCodeInvalidRecord)
+	}
+
+	baseOffset, logStartOffset, err := appendToLog(partitionDir(b.logDir, topicName, partition.index), batches)
+	if err != nil {
+		fmt.Printf("Error writing to the log of partition %d of topic %s: %v\n", partition.index, topicName, err)
+		return produceError(partition.index, errorCodeKafkaStorageError)
+	}
+
+	return producePartitionResponse{
+		index:          partition.index,
+		baseOffset:     baseOffset,
+		logStartOffset: logStartOffset,
+	}
+}
+
+// decodeProducedBatches decodes the record batches that a Produce request
+// wants to add to a partition, and checks that they can be added to a log.
+func decodeProducedBatches(records []byte) ([]recordBatch, error) {
+	batches, err := decodeRecordBatches(records)
+	if err != nil {
+		return nil, err
+	}
+	if len(batches) == 0 {
+		return nil, errors.New("no record batch")
+	}
+
+	for i, batch := range batches {
+		if err := batch.validate(); err != nil {
+			return nil, fmt.Errorf("record batch %d: %w", i, err)
+		}
+	}
+
+	return batches, nil
 }

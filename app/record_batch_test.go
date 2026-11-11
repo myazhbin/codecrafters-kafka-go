@@ -273,6 +273,88 @@ func TestDecodeRecordBatches(t *testing.T) {
 	}
 }
 
+func TestRecordBatchValidate(t *testing.T) {
+	valid := encodeRecordBatch(testBatch{values: [][]byte{[]byte("a"), []byte("b")}})
+
+	// withByte returns a copy of the valid batch in which one byte is changed.
+	withByte := func(offset int, value byte) []byte {
+		b := bytes.Clone(valid)
+		b[offset] = value
+		return b
+	}
+
+	tests := []struct {
+		name    string
+		batch   []byte
+		wantErr string // empty for a valid batch
+	}{
+		{name: "valid batch", batch: valid},
+		{name: "single record", batch: encodeRecordBatch(testBatch{values: [][]byte{[]byte("a")}})},
+		{name: "null value", batch: encodeRecordBatch(testBatch{values: [][]byte{nil}})},
+		// The records of a compressed batch are not looked at.
+		{name: "compressed batch", batch: withByte(22, 0x04)},
+
+		{name: "control batch", batch: withByte(22, 0x20), wantErr: "control"},
+		{name: "last offset delta larger than the record count", batch: withByte(26, 5), wantErr: "last offset delta"},
+		{name: "last offset delta smaller than the record count", batch: withByte(26, 0), wantErr: "last offset delta"},
+		{name: "negative last offset delta", batch: withByte(23, 0xff), wantErr: "last offset delta"},
+		{name: "fewer records than announced", batch: encodeRecordBatchWithCount(3, 2), wantErr: "last offset delta"},
+		{name: "corrupt record", batch: withByte(61, 0x7e), wantErr: "invalid records"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batches, err := decodeRecordBatches(tt.batch)
+			if err != nil {
+				t.Fatalf("failed to decode the batch: %v", err)
+			}
+			if len(batches) != 1 {
+				t.Fatalf("decoded %d batches, want 1", len(batches))
+			}
+
+			err = batches[0].validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tt.wantErr != "" && err == nil:
+				t.Error("expected an error, got nil")
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	// A batch without any record.
+	t.Run("empty batch", func(t *testing.T) {
+		empty := bytes.Clone(valid[:61])
+		empty[11] = 49                                     // batch length: only the header
+		copy(empty[23:27], []byte{0xff, 0xff, 0xff, 0xff}) // last offset delta: -1
+		copy(empty[57:61], []byte{0, 0, 0, 0})             // record count: 0
+
+		batches, err := decodeRecordBatches(empty)
+		if err != nil || len(batches) != 1 {
+			t.Fatalf("failed to decode the batch: %v", err)
+		}
+		if err := batches[0].validate(); err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
+}
+
+// encodeRecordBatchWithCount builds a batch with the given number of records,
+// whose header announces another number of records and a last offset delta to
+// match.
+func encodeRecordBatchWithCount(records, announced int) []byte {
+	values := make([][]byte, records)
+	for i := range values {
+		values[i] = []byte{byte('a' + i)}
+	}
+
+	batch := encodeRecordBatch(testBatch{values: values})
+	batch[60] = byte(announced)
+	return batch
+}
+
 // The batches built by the test fixtures must be byte for byte what Kafka
 // writes: encodeRecordBatch has to reproduce the batches of the CodeCrafters
 // cluster metadata log, including their CRC.

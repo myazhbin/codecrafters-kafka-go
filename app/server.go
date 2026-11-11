@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
 
 // broker is a Kafka broker.
@@ -15,6 +16,10 @@ type broker struct {
 	// logDir is the directory that holds the logs of the partitions,
 	// including the cluster metadata log.
 	logDir string
+
+	// logMu guards the logs of the partitions: records are not appended to a
+	// log while a client reads from one or another client appends to one.
+	logMu sync.RWMutex
 }
 
 // serve accepts connections on l until the listener fails or is closed. Every

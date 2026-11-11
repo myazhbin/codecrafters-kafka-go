@@ -15,6 +15,7 @@ const (
 	errorCodeUnknownTopicOrPartition int16 = 3
 	errorCodeUnsupportedVersion      int16 = 35
 	errorCodeKafkaStorageError       int16 = 56
+	errorCodeInvalidRecord           int16 = 87
 	errorCodeUnknownTopicID          int16 = 100
 )
 

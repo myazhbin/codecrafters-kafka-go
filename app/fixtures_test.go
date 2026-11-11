@@ -280,6 +280,20 @@ func writeLogSegment(t *testing.T, logDir, topic string, partition int32, data [
 	writeFile(t, filepath.Join(dir, "00000000000000000000.log"), data)
 }
 
+// readLogSegment returns the contents of the first segment of the log of a
+// partition in a broker's log directory, and fails the test if that segment
+// doesn't exist.
+func readLogSegment(t *testing.T, logDir, topic string, partition int32) []byte {
+	t.Helper()
+
+	path := filepath.Join(logDir, fmt.Sprintf("%s-%d", topic, partition), "00000000000000000000.log")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read log segment: %v", err)
+	}
+	return data
+}
+
 // writeClusterMetadataLog writes a cluster metadata log that describes topics
 // to a broker's log directory.
 func writeClusterMetadataLog(t *testing.T, logDir string, topics ...testTopic) {

@@ -143,6 +143,9 @@ func (b *broker) handleFetch(d *decoder) ([]byte, error) {
 		return nil, err
 	}
 
+	b.logMu.RLock()
+	defer b.logMu.RUnlock()
+
 	topics := make([]fetchTopicResponse, 0, len(request.topics))
 	for _, topic := range request.topics {
 		response := fetchTopicResponse{topicID: topic.topicID}

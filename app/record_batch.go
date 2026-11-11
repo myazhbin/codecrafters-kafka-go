@@ -73,6 +73,28 @@ func (b recordBatch) records() ([]record, error) {
 	return records, nil
 }
 
+// validate checks that the batch is one that a producer may add to a log.
+func (b recordBatch) validate() error {
+	if b.isControl() {
+		return errors.New("control batches can't be produced")
+	}
+
+	// The offsets of the records of a batch are consecutive, so the delta of
+	// the last one has to match the number of records.
+	if count := int64(b.lastOffsetDelta) + 1; count <= 0 || count != int64(b.recordCount) {
+		return fmt.Errorf("last offset delta (%d) doesn't match record count (%d)", b.lastOffsetDelta, b.recordCount)
+	}
+
+	// The records of a compressed batch can't be looked at.
+	if b.attributes&batchCompressionMask == 0 {
+		if _, err := b.records(); err != nil {
+			return fmt.Errorf("invalid records: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // record is a single record of a record batch.
 type record struct {
 	attributes     int8
