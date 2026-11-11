@@ -803,6 +803,168 @@ func TestProduceToMultiplePartitions(t *testing.T) {
 	}
 }
 
+// Stage ov0: a Produce request for several partitions of several topics
+// writes the record batch of each partition to the log file of that
+// partition, and is answered with a result for every topic and partition.
+func TestProduceToMultipleTopics(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "apple", id: testTopicID(1), partitions: []int32{0, 1, 2}},
+		testTopic{name: "mango", id: testTopicID(2), partitions: []int32{0}},
+		testTopic{name: "zebra", id: testTopicID(3), partitions: []int32{0, 1}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	// One record batch with a single record for each partition of each
+	// topic. Neither the topics nor the partitions are sorted.
+	request := []produceTopic{
+		{name: "zebra", partitions: []producePartition{
+			{index: 1, records: helloBatch("Hello zebra-1!")},
+			{index: 0, records: helloBatch("Hello zebra-0!")},
+		}},
+		{name: "apple", partitions: []producePartition{
+			{index: 0, records: helloBatch("Hello apple-0!")},
+			{index: 2, records: helloBatch("Hello apple-2!")},
+			{index: 1, records: helloBatch("Hello apple-1!")},
+		}},
+		{name: "mango", partitions: []producePartition{
+			{index: 0, records: helloBatch("Hello mango-0!")},
+		}},
+	}
+
+	body := produce(t, addr, request...)
+
+	// The topics field has one element for each topic in the request.
+	if len(body.topics) != len(request) {
+		t.Fatalf("topics has %d elements, want %d", len(body.topics), len(request))
+	}
+	for i, wantTopic := range request {
+		topic := body.topics[i]
+
+		// The name matches the topic name in the request.
+		if topic.name != wantTopic.name {
+			t.Errorf("topics[%d]: name = %q, want %q", i, topic.name, wantTopic.name)
+		}
+
+		// The partitions field has one element for each partition of that
+		// topic in the request.
+		if len(topic.partitions) != len(wantTopic.partitions) {
+			t.Fatalf("topics[%d]: partitions has %d elements, want %d", i, len(topic.partitions), len(wantTopic.partitions))
+		}
+		for j, partition := range wantTopic.partitions {
+			want := producedPartition{
+				// The index matches the partition index in the request.
+				index: partition.index,
+				// The error_code is 0 (NO_ERROR).
+				errorCode: 0,
+				// The base_offset is 0: this is the first record in each
+				// partition.
+				baseOffset: 0,
+				// The log_append_time_ms is -1.
+				logAppendTimeMs: -1,
+				// The log_start_offset is 0.
+				logStartOffset: 0,
+			}
+			if got := topic.partitions[j]; !reflect.DeepEqual(got, want) {
+				t.Errorf("topics[%d].partitions[%d] = %+v, want %+v", i, j, got, want)
+			}
+
+			// Each record batch is persisted to the log file of its
+			// partition.
+			if got := readLogSegment(t, logDir, wantTopic.name, partition.index); !bytes.Equal(got, partition.records) {
+				t.Errorf("log file of %s-%d = % x, want the record batch sent for it: % x",
+					wantTopic.name, partition.index, got, partition.records)
+			}
+		}
+	}
+
+	// Only the logs of the six partitions were written.
+	wantEntries := []string{"__cluster_metadata-0", "apple-0", "apple-1", "apple-2", "mango-0", "zebra-0", "zebra-1"}
+	if entries := listDir(t, logDir); !reflect.DeepEqual(entries, wantEntries) {
+		t.Errorf("log directory contains %q, want %q", entries, wantEntries)
+	}
+
+	// Consumers find each record in the partition that it was produced to.
+	fetched := fetch(t, addr,
+		fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 0}, {index: 1}, {index: 2}}},
+		fetchTopic{topicID: testTopicID(2), partitions: []fetchPartition{{index: 0}}},
+		fetchTopic{topicID: testTopicID(3), partitions: []fetchPartition{{index: 0}, {index: 1}}},
+	)
+	wantMessages := [][]string{
+		{"Hello apple-0!", "Hello apple-1!", "Hello apple-2!"},
+		{"Hello mango-0!"},
+		{"Hello zebra-0!", "Hello zebra-1!"},
+	}
+	if len(fetched.topics) != len(wantMessages) {
+		t.Fatalf("Fetch response has %d topics, want %d", len(fetched.topics), len(wantMessages))
+	}
+	for i, messages := range wantMessages {
+		if len(fetched.topics[i].partitions) != len(messages) {
+			t.Fatalf("Fetch response: topics[%d] has %d partitions, want %d", i, len(fetched.topics[i].partitions), len(messages))
+		}
+		for j, message := range messages {
+			partition := fetched.topics[i].partitions[j]
+			if got, want := fetchedValues(t, partition), [][]string{{message}}; partition.errorCode != 0 || !reflect.DeepEqual(got, want) {
+				t.Errorf("Fetch response: topics[%d].partitions[%d] = {error_code: %d, messages: %q}, want %q",
+					i, j, partition.errorCode, got, want)
+			}
+		}
+	}
+}
+
+// A request may mix topics that exist with ones that don't: the records for
+// the existing ones are stored.
+func TestProduceToMultipleTopicsWithFailures(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "apple", id: testTopicID(1), partitions: []int32{0}},
+		testTopic{name: "zebra", id: testTopicID(2), partitions: []int32{0}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	appleBatch, zebraBatch := helloBatch("Hello apple!"), helloBatch("Hello zebra!")
+
+	body := produce(t, addr,
+		produceTopic{name: "zebra", partitions: []producePartition{{index: 0, records: zebraBatch}, {index: 1, records: helloBatch("lost")}}},
+		produceTopic{name: "nope", partitions: []producePartition{{index: 0, records: helloBatch("lost")}}},
+		produceTopic{name: "apple", partitions: []producePartition{{index: 0, records: appleBatch}}},
+	)
+
+	if len(body.topics) != 3 {
+		t.Fatalf("topics has %d elements, want 3", len(body.topics))
+	}
+	for i, want := range []struct {
+		name       string
+		partitions int
+	}{{"zebra", 2}, {"nope", 1}, {"apple", 1}} {
+		if body.topics[i].name != want.name || len(body.topics[i].partitions) != want.partitions {
+			t.Fatalf("topics[%d] = %+v, want the topic %q with %d partitions", i, body.topics[i], want.name, want.partitions)
+		}
+	}
+
+	success := func(index int32) producedPartition {
+		return producedPartition{index: index, logAppendTimeMs: -1}
+	}
+	if got := body.topics[0].partitions[0]; !reflect.DeepEqual(got, success(0)) {
+		t.Errorf("zebra-0 = %+v, want %+v", got, success(0))
+	}
+	expectProduceError(t, body.topics[0].partitions[1], 1, 3)
+	expectProduceError(t, body.topics[1].partitions[0], 0, 3)
+	if got := body.topics[2].partitions[0]; !reflect.DeepEqual(got, success(0)) {
+		t.Errorf("apple-0 = %+v, want %+v", got, success(0))
+	}
+
+	if got := readLogSegment(t, logDir, "zebra", 0); !bytes.Equal(got, zebraBatch) {
+		t.Errorf("log file of zebra-0 = % x, want % x", got, zebraBatch)
+	}
+	if got := readLogSegment(t, logDir, "apple", 0); !bytes.Equal(got, appleBatch) {
+		t.Errorf("log file of apple-0 = % x, want % x", got, appleBatch)
+	}
+	if entries, want := listDir(t, logDir), []string{"__cluster_metadata-0", "apple-0", "zebra-0"}; !reflect.DeepEqual(entries, want) {
+		t.Errorf("log directory contains %q, want %q", entries, want)
+	}
+}
+
 // A partition that can't be written to doesn't keep the records of the other
 // partitions of the request from being stored.
 func TestProduceToMultiplePartitionsWithFailures(t *testing.T) {
