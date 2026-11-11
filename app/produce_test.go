@@ -704,6 +704,139 @@ func TestProduceMultipleRecords(t *testing.T) {
 	}
 }
 
+// Stage ct4: a Produce request for several partitions of a topic writes the
+// record batch of each partition to the log file of that partition, and is
+// answered with a result for every partition.
+func TestProduceToMultiplePartitions(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "bar", id: testTopicID(1), partitions: []int32{0}},
+		testTopic{name: "foo", id: testTopicID(2), partitions: []int32{0, 1, 2}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	// One record batch with a single record for each partition, in an order
+	// that is not the one of the partition indexes.
+	request := []producePartition{
+		{index: 1, records: helloBatch("Hello partition 1!")},
+		{index: 0, records: helloBatch("Hello partition 0!")},
+		{index: 2, records: helloBatch("Hello partition 2!")},
+	}
+
+	body := produce(t, addr, produceTopic{name: "foo", partitions: request})
+
+	// The topics field has 1 element, whose name matches the topic name in
+	// the request.
+	if len(body.topics) != 1 {
+		t.Fatalf("topics has %d elements, want 1", len(body.topics))
+	}
+	topic := body.topics[0]
+	if topic.name != "foo" {
+		t.Errorf("name = %q, want %q", topic.name, "foo")
+	}
+
+	// The partitions field has one element for each partition in the request.
+	if len(topic.partitions) != len(request) {
+		t.Fatalf("partitions has %d elements, want %d", len(topic.partitions), len(request))
+	}
+	for i, partition := range request {
+		want := producedPartition{
+			// The index matches the partition index in the request.
+			index: partition.index,
+			// The error_code is 0 (NO_ERROR).
+			errorCode: 0,
+			// The base_offset is 0: this is the first record in each
+			// partition.
+			baseOffset: 0,
+			// The log_append_time_ms is -1.
+			logAppendTimeMs: -1,
+			// The log_start_offset is 0.
+			logStartOffset: 0,
+		}
+		if got := topic.partitions[i]; !reflect.DeepEqual(got, want) {
+			t.Errorf("partitions[%d] = %+v, want %+v", i, got, want)
+		}
+
+		// Each record batch is persisted to the log file of its partition.
+		if got := readLogSegment(t, logDir, "foo", partition.index); !bytes.Equal(got, partition.records) {
+			t.Errorf("log file of partition %d = % x, want the record batch sent for it: % x", partition.index, got, partition.records)
+		}
+	}
+
+	// Only the logs of the three partitions were written.
+	if entries, want := listDir(t, logDir), []string{"__cluster_metadata-0", "foo-0", "foo-1", "foo-2"}; !reflect.DeepEqual(entries, want) {
+		t.Errorf("log directory contains %q, want %q", entries, want)
+	}
+
+	// Each partition has offsets of its own: a second request continues
+	// every partition where the first one left it.
+	body = produce(t, addr, produceTopic{name: "foo", partitions: []producePartition{
+		{index: 2, records: helloBatch("More for partition 2!", "And more!")},
+		{index: 0, records: helloBatch("More for partition 0!")},
+	}})
+	if len(body.topics) != 1 || len(body.topics[0].partitions) != 2 {
+		t.Fatalf("unexpected response to the second request: %+v", body)
+	}
+	for i, index := range []int32{2, 0} {
+		want := producedPartition{index: index, baseOffset: 1, logAppendTimeMs: -1}
+		if got := body.topics[0].partitions[i]; !reflect.DeepEqual(got, want) {
+			t.Errorf("second request: partitions[%d] = %+v, want %+v", i, got, want)
+		}
+	}
+
+	for index, wantOffsets := range map[int32][][2]int64{
+		0: {{0, 0}, {1, 1}},
+		1: {{0, 0}},
+		2: {{0, 0}, {1, 2}},
+	} {
+		batches := mustDecodeBatches(t, readLogSegment(t, logDir, "foo", index))
+		if len(batches) != len(wantOffsets) {
+			t.Errorf("the log of partition %d holds %d batches, want %d", index, len(batches), len(wantOffsets))
+			continue
+		}
+		for i, want := range wantOffsets {
+			if batches[i].baseOffset != want[0] || batches[i].lastOffset() != want[1] {
+				t.Errorf("partition %d: batch %d has the offsets %d-%d, want %d-%d",
+					index, i, batches[i].baseOffset, batches[i].lastOffset(), want[0], want[1])
+			}
+		}
+	}
+}
+
+// A partition that can't be written to doesn't keep the records of the other
+// partitions of the request from being stored.
+func TestProduceToMultiplePartitionsWithFailures(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0, 1}})
+	addr := startTestServerWithLogDir(t, logDir)
+
+	stored := helloBatch("stored")
+
+	body := produce(t, addr, produceTopic{name: "foo", partitions: []producePartition{
+		{index: 7, records: helloBatch("unknown partition")},
+		{index: 0, records: stored},
+		{index: 1, records: []byte("not a record batch")},
+	}})
+
+	if len(body.topics) != 1 || len(body.topics[0].partitions) != 3 {
+		t.Fatalf("unexpected response: %+v", body)
+	}
+	partitions := body.topics[0].partitions
+
+	expectProduceError(t, partitions[0], 7, 3)
+	if want := (producedPartition{index: 0, logAppendTimeMs: -1}); !reflect.DeepEqual(partitions[1], want) {
+		t.Errorf("partitions[1] = %+v, want %+v", partitions[1], want)
+	}
+	expectProduceError(t, partitions[2], 1, 87)
+
+	if got := readLogSegment(t, logDir, "foo", 0); !bytes.Equal(got, stored) {
+		t.Errorf("log file of partition 0 = % x, want % x", got, stored)
+	}
+	if entries, want := listDir(t, logDir), []string{"__cluster_metadata-0", "foo-0"}; !reflect.DeepEqual(entries, want) {
+		t.Errorf("log directory contains %q, want %q", entries, want)
+	}
+}
+
 // listDir returns the names of the entries of a directory, sorted.
 func listDir(t *testing.T, dir string) []string {
 	t.Helper()
