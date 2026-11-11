@@ -66,13 +66,43 @@ func decodeFetchRequest(d *decoder) (fetchRequest, error) {
 	return request, d.err
 }
 
+// fetchTopicResponse is what a Fetch response says about one topic.
+type fetchTopicResponse struct {
+	topicID    uuid
+	partitions []fetchPartitionResponse
+}
+
+// fetchPartitionResponse is what a Fetch response says about one partition.
+type fetchPartitionResponse struct {
+	index     int32
+	errorCode int16
+}
+
 // encodeFetchResponse encodes the body of a Fetch response (v16).
-func encodeFetchResponse() []byte {
+func encodeFetchResponse(topics []fetchTopicResponse) []byte {
 	var e encoder
-	e.int32(0)              // throttle_time_ms
-	e.int16(errorCodeNone)  // error_code
-	e.int32(0)              // session_id: the fetch is not part of a session
-	e.compactArrayLength(0) // responses
+	e.int32(0)             // throttle_time_ms
+	e.int16(errorCodeNone) // error_code
+	e.int32(0)             // session_id: the fetch is not part of a session
+
+	e.compactArrayLength(len(topics)) // responses
+	for _, topic := range topics {
+		e.uuid(topic.topicID)
+
+		e.compactArrayLength(len(topic.partitions))
+		for _, partition := range topic.partitions {
+			e.int32(partition.index)
+			e.int16(partition.errorCode)
+			e.int64(-1)             // high_watermark: unknown
+			e.int64(-1)             // last_stable_offset: unknown
+			e.int64(-1)             // log_start_offset: unknown
+			e.compactArrayLength(0) // aborted_transactions
+			e.int32(-1)             // preferred_read_replica: none
+			e.compactBytes(nil)     // records
+			e.emptyTaggedFields()
+		}
+		e.emptyTaggedFields()
+	}
 	e.emptyTaggedFields()
 
 	return e.buf
@@ -81,9 +111,24 @@ func encodeFetchResponse() []byte {
 // handleFetch builds the body of the response to a Fetch request, whose body
 // is read from d.
 func (b *broker) handleFetch(d *decoder) ([]byte, error) {
-	if _, err := decodeFetchRequest(d); err != nil {
+	request, err := decodeFetchRequest(d)
+	if err != nil {
 		return nil, fmt.Errorf("parsing Fetch request: %w", err)
 	}
 
-	return encodeFetchResponse(), nil
+	// The broker can't serve the records of any topic yet: all the requested
+	// partitions are reported as belonging to an unknown topic.
+	topics := make([]fetchTopicResponse, 0, len(request.topics))
+	for _, topic := range request.topics {
+		response := fetchTopicResponse{topicID: topic.topicID}
+		for _, partition := range topic.partitions {
+			response.partitions = append(response.partitions, fetchPartitionResponse{
+				index:     partition.index,
+				errorCode: errorCodeUnknownTopicID,
+			})
+		}
+		topics = append(topics, response)
+	}
+
+	return encodeFetchResponse(topics), nil
 }

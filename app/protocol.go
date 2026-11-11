@@ -357,6 +357,11 @@ func (e *encoder) int32(v int32) {
 	e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
 }
 
+// int64 encodes an INT64.
+func (e *encoder) int64(v int64) {
+	e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(v))
+}
+
 // uvarint encodes an UNSIGNED_VARINT.
 func (e *encoder) uvarint(v uint32) {
 	e.buf = binary.AppendUvarint(e.buf, uint64(v))
@@ -372,6 +377,14 @@ func (e *encoder) uuid(v uuid) {
 func (e *encoder) compactString(s string) {
 	e.uvarint(uint32(len(s) + 1))
 	e.buf = append(e.buf, s...)
+}
+
+// compactBytes encodes COMPACT_BYTES: the number of bytes + 1 as an
+// UNSIGNED_VARINT, followed by the bytes. COMPACT_RECORDS, which hold record
+// batches, are encoded the same way.
+func (e *encoder) compactBytes(b []byte) {
+	e.uvarint(uint32(len(b) + 1))
+	e.buf = append(e.buf, b...)
 }
 
 // compactArrayLength encodes the length of a COMPACT_ARRAY of n elements. It

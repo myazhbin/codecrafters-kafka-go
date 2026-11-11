@@ -329,20 +329,88 @@ func TestDecodeFetchRequest(t *testing.T) {
 }
 
 func TestEncodeFetchResponse(t *testing.T) {
-	got := encodeFetchResponse()
-
-	want := mustDecodeHex(t, "00000000"+ // throttle_time_ms: 0
-		"0000"+ // error_code: 0
-		"00000000"+ // session_id: 0
-		"01"+ // responses: empty
-		"00") // tag buffer
-	if !bytes.Equal(got, want) {
-		t.Errorf("body = % x, want % x", got, want)
+	tests := []struct {
+		name   string
+		topics []fetchTopicResponse
+		want   string
+	}{
+		{
+			name:   "no topics",
+			topics: nil,
+			want: "00000000" + // throttle_time_ms: 0
+				"0000" + // error_code: 0
+				"00000000" + // session_id: 0
+				"01" + // responses: empty
+				"00", // tag buffer
+		},
+		{
+			name: "unknown topic",
+			topics: []fetchTopicResponse{{
+				topicID:    sazTopicID,
+				partitions: []fetchPartitionResponse{{index: 0, errorCode: 100}},
+			}},
+			want: "00000000" + // throttle_time_ms: 0
+				"0000" + // error_code: 0
+				"00000000" + // session_id: 0
+				"02" + // responses: 1 element
+				"00000000000040008000000000000091" + // topic_id
+				"02" + // partitions: 1 element
+				"00000000" + // partition_index: 0
+				"0064" + // error_code: 100 (UNKNOWN_TOPIC_ID)
+				"ffffffffffffffff" + // high_watermark: -1
+				"ffffffffffffffff" + // last_stable_offset: -1
+				"ffffffffffffffff" + // log_start_offset: -1
+				"01" + // aborted_transactions: empty
+				"ffffffff" + // preferred_read_replica: -1
+				"01" + // records: empty
+				"00" + // tag buffer
+				"00" + // tag buffer
+				"00", // tag buffer
+		},
+		{
+			name: "several topics and partitions",
+			topics: []fetchTopicResponse{
+				{
+					topicID: testTopicID(1),
+					partitions: []fetchPartitionResponse{
+						{index: 0, errorCode: 100},
+						{index: 5, errorCode: 100},
+					},
+				},
+				{topicID: testTopicID(2)},
+			},
+			want: "00000000 0000 00000000" +
+				"03" +
+				"00000000000040008000000000000001" +
+				"03" +
+				"00000000 0064 ffffffffffffffff ffffffffffffffff ffffffffffffffff 01 ffffffff 01 00" +
+				"00000005 0064 ffffffffffffffff ffffffffffffffff ffffffffffffffff 01 ffffffff 01 00" +
+				"00" +
+				"00000000000040008000000000000002" +
+				"01" +
+				"00" +
+				"00",
+		},
 	}
 
-	// The body must also be a valid Fetch response.
-	if decoded := decodeFetchResponse(t, got); len(decoded.topics) != 0 {
-		t.Errorf("decoded %d topics, want none", len(decoded.topics))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := encodeFetchResponse(tt.topics)
+			if want := mustDecodeHex(t, tt.want); !bytes.Equal(got, want) {
+				t.Errorf("body = % x, want % x", got, want)
+			}
+
+			// The body must also be a valid Fetch response.
+			decoded := decodeFetchResponse(t, got)
+			if len(decoded.topics) != len(tt.topics) {
+				t.Fatalf("decoded %d topics, want %d", len(decoded.topics), len(tt.topics))
+			}
+			for i, topic := range tt.topics {
+				if decoded.topics[i].topicID != topic.topicID || len(decoded.topics[i].partitions) != len(topic.partitions) {
+					t.Errorf("decoded topics[%d] = %+v, want %+v", i, decoded.topics[i], topic)
+				}
+			}
+		})
 	}
 }
 
@@ -412,6 +480,92 @@ func TestFetchWithNoTopics(t *testing.T) {
 		send(t, conn, newApiVersionsRequest(3))
 		expectApiVersionsResponse(t, conn, 3)
 	})
+}
+
+// Stage hn6: a Fetch request for a topic ID that doesn't exist is answered
+// with the error code UNKNOWN_TOPIC_ID for the requested partition.
+func TestFetchUnknownTopic(t *testing.T) {
+	unknownTopicID := uuid{0x71, 0xa5, 0x9a, 0x51, 0x89, 0x68, 0x4f, 0x8b, 0x93, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x05, 0x47}
+
+	t.Run("single topic", func(t *testing.T) {
+		addr := startTestServer(t)
+
+		body := fetch(t, addr, fetchTopic{topicID: unknownTopicID, partitions: []fetchPartition{{index: 0}}})
+
+		// The error code of the response is 0 (No Error), its
+		// throttle_time_ms is 0.
+		if body.errorCode != 0 {
+			t.Errorf("error_code = %d, want 0", body.errorCode)
+		}
+		if body.throttleTimeMs != 0 {
+			t.Errorf("throttle_time_ms = %d, want 0", body.throttleTimeMs)
+		}
+
+		// The responses field has 1 element, whose topic_id matches what was
+		// sent in the request.
+		if len(body.topics) != 1 {
+			t.Fatalf("responses has %d elements, want 1", len(body.topics))
+		}
+		topic := body.topics[0]
+		if topic.topicID != unknownTopicID {
+			t.Errorf("topic_id = %v, want %v", topic.topicID, unknownTopicID)
+		}
+
+		// The partitions array has 1 element, whose partition_index is 0 and
+		// whose error_code is 100 (UNKNOWN_TOPIC_ID).
+		if len(topic.partitions) != 1 {
+			t.Fatalf("partitions has %d elements, want 1", len(topic.partitions))
+		}
+		expectFetchError(t, topic.partitions[0], 0, 100)
+	})
+
+	t.Run("several topics and partitions", func(t *testing.T) {
+		addr := startTestServer(t)
+
+		request := []fetchTopic{
+			{topicID: testTopicID(2), partitions: []fetchPartition{{index: 0}, {index: 3}}},
+			{topicID: testTopicID(1), partitions: []fetchPartition{{index: 1}}},
+		}
+		body := fetch(t, addr, request...)
+
+		if body.errorCode != 0 {
+			t.Errorf("error_code = %d, want 0", body.errorCode)
+		}
+
+		// The response has the topics and partitions of the request, in the
+		// same order.
+		if len(body.topics) != len(request) {
+			t.Fatalf("responses has %d elements, want %d", len(body.topics), len(request))
+		}
+		for i, want := range request {
+			got := body.topics[i]
+			if got.topicID != want.topicID {
+				t.Errorf("responses[%d]: topic_id = %v, want %v", i, got.topicID, want.topicID)
+			}
+			if len(got.partitions) != len(want.partitions) {
+				t.Fatalf("responses[%d]: partitions has %d elements, want %d", i, len(got.partitions), len(want.partitions))
+			}
+			for j, partition := range want.partitions {
+				expectFetchError(t, got.partitions[j], partition.index, 100)
+			}
+		}
+	})
+}
+
+// expectFetchError checks that partition is how the broker answers a fetch
+// that failed with the given error code: without any records.
+func expectFetchError(t *testing.T, partition fetchedPartition, index int32, errorCode int16) {
+	t.Helper()
+
+	if partition.index != index {
+		t.Errorf("partition_index = %d, want %d", partition.index, index)
+	}
+	if partition.errorCode != errorCode {
+		t.Errorf("partition %d: error_code = %d, want %d", index, partition.errorCode, errorCode)
+	}
+	if len(partition.records) != 0 {
+		t.Errorf("partition %d: got %d bytes of records, want none", index, len(partition.records))
+	}
 }
 
 // The broker only supports version 16 of Fetch: requests for other versions,

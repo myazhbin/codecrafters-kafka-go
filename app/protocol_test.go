@@ -392,9 +392,11 @@ func TestEncoderIntegers(t *testing.T) {
 	e.int16(-2)
 	e.int32(0x01020304)
 	e.int32(-2)
+	e.int64(0x0102030405060708)
+	e.int64(-2)
 	e.raw([]byte{0xaa, 0xbb})
 
-	if want := mustDecodeHex(t, "01 ff 0102 fffe 01020304 fffffffe aabb"); !bytes.Equal(e.buf, want) {
+	if want := mustDecodeHex(t, "01 ff 0102 fffe 01020304 fffffffe 0102030405060708 fffffffffffffffe aabb"); !bytes.Equal(e.buf, want) {
 		t.Errorf("encoded = % x, want % x", e.buf, want)
 	}
 }
@@ -576,6 +578,27 @@ func TestEncoderCompactArrayLength(t *testing.T) {
 
 		if want := mustDecodeHex(t, tt.want); !bytes.Equal(e.buf, want) {
 			t.Errorf("compactArrayLength(%d) = % x, want % x", tt.elements, e.buf, want)
+		}
+	}
+}
+
+func TestEncoderCompactBytes(t *testing.T) {
+	tests := []struct {
+		value []byte
+		want  string
+	}{
+		{value: nil, want: "01"},
+		{value: []byte{}, want: "01"},
+		{value: []byte{0xaa, 0xbb, 0xcc}, want: "04 aabbcc"},
+		{value: bytes.Repeat([]byte{0xee}, 200), want: "c901" + strings.Repeat("ee", 200)},
+	}
+
+	for _, tt := range tests {
+		var e encoder
+		e.compactBytes(tt.value)
+
+		if want := mustDecodeHex(t, tt.want); !bytes.Equal(e.buf, want) {
+			t.Errorf("compactBytes(% x) = % x, want % x", tt.value, e.buf, want)
 		}
 	}
 }

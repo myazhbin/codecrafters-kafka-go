@@ -12,6 +12,7 @@ const (
 	errorCodeNone                    int16 = 0
 	errorCodeUnknownTopicOrPartition int16 = 3
 	errorCodeUnsupportedVersion      int16 = 35
+	errorCodeUnknownTopicID          int16 = 100
 )
 
 // apiVersionRange is the range of versions of an API that the broker supports.
