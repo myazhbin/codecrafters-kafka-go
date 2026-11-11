@@ -7,16 +7,26 @@ import (
 	"net"
 )
 
+// broker is a Kafka broker.
+//
+// It keeps no state in memory: what it knows about the cluster is read from
+// the files in its log directory whenever a request needs it.
+type broker struct {
+	// logDir is the directory that holds the logs of the partitions,
+	// including the cluster metadata log.
+	logDir string
+}
+
 // serve accepts connections on l until the listener fails or is closed. Every
 // client is served by its own goroutine, so clients don't have to wait for
 // each other.
-func serve(l net.Listener) error {
+func (b *broker) serve(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			return err
 		}
-		go handleConnection(conn)
+		go b.handleConnection(conn)
 	}
 }
 
@@ -25,7 +35,7 @@ func serve(l net.Listener) error {
 //
 // Like Kafka, the broker closes the connection when it gets a request that it
 // can't parse or that it doesn't support.
-func handleConnection(conn net.Conn) {
+func (b *broker) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	for {
@@ -38,7 +48,7 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		response, err := handleRequest(message)
+		response, err := b.handleRequest(message)
 		if err != nil {
 			fmt.Println("Error handling request: ", err.Error())
 			return
@@ -53,7 +63,7 @@ func handleConnection(conn net.Conn) {
 
 // handleRequest builds the response message for a request message (the header
 // and body of a request, without the message_size that precedes them).
-func handleRequest(message []byte) ([]byte, error) {
+func (b *broker) handleRequest(message []byte) ([]byte, error) {
 	d := newDecoder(message)
 
 	header, err := decodeRequestHeader(d)
@@ -74,7 +84,7 @@ func handleRequest(message []byte) ([]byte, error) {
 
 	switch header.apiKey {
 	case apiKeyDescribeTopicPartitions:
-		body, err := handleDescribeTopicPartitions(d)
+		body, err := b.handleDescribeTopicPartitions(d)
 		if err != nil {
 			return nil, err
 		}

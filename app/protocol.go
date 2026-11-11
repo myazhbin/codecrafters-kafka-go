@@ -100,6 +100,21 @@ func (d *decoder) bytes(n int) []byte {
 	return b
 }
 
+// sub consumes the next n bytes of the message and returns a decoder that
+// reads from them. It is used for the parts of a message that announce their
+// own size. A failure of the returned decoder has to be handed back with fail.
+func (d *decoder) sub(n int) *decoder {
+	return &decoder{buf: d.bytes(n), err: d.err}
+}
+
+// fail records err as the failure of the decoder, unless the decoder has
+// already failed or err is nil.
+func (d *decoder) fail(err error) {
+	if d.err == nil {
+		d.err = err
+	}
+}
+
 // int8 decodes an INT8.
 func (d *decoder) int8() int8 {
 	b := d.bytes(1)
@@ -125,6 +140,59 @@ func (d *decoder) int32() int32 {
 		return 0
 	}
 	return int32(binary.BigEndian.Uint32(b))
+}
+
+// int64 decodes an INT64.
+func (d *decoder) int64() int64 {
+	b := d.bytes(8)
+	if d.err != nil {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(b))
+}
+
+// uuid decodes a UUID.
+func (d *decoder) uuid() uuid {
+	b := d.bytes(16)
+	if d.err != nil {
+		return uuid{}
+	}
+	return uuid(b)
+}
+
+// varlong decodes a VARLONG: a 64-bit integer in zigzag encoding, stored in a
+// variable number of bytes.
+func (d *decoder) varlong() int64 {
+	if d.err != nil {
+		return 0
+	}
+
+	v, n := binary.Varint(d.buf)
+	switch {
+	case n == 0:
+		d.err = errTruncated
+		return 0
+	case n < 0:
+		d.err = errors.New("varlong overflows 64 bits")
+		return 0
+	}
+
+	d.buf = d.buf[n:]
+	return v
+}
+
+// varint decodes a VARINT: a 32-bit integer in zigzag encoding, stored in a
+// variable number of bytes.
+func (d *decoder) varint() int32 {
+	v := d.varlong()
+	if d.err != nil {
+		return 0
+	}
+	if v < math.MinInt32 || v > math.MaxInt32 {
+		d.err = errors.New("varint overflows 32 bits")
+		return 0
+	}
+	return int32(v)
 }
 
 // uvarint decodes an UNSIGNED_VARINT.
@@ -201,6 +269,20 @@ func (d *decoder) compactArrayLength() int {
 		return 0
 	}
 	return int(n - 1)
+}
+
+// compactInt32Array decodes a COMPACT_ARRAY of INT32 values.
+func (d *decoder) compactInt32Array() []int32 {
+	n := d.compactArrayLength()
+
+	var values []int32
+	for i := 0; i < n && d.err == nil; i++ {
+		values = append(values, d.int32())
+	}
+	if d.err != nil {
+		return nil
+	}
+	return values
 }
 
 // taggedFields skips over a TAG_BUFFER: the number of tagged fields, then for
@@ -296,6 +378,14 @@ func (e *encoder) compactString(s string) {
 // is stored as n + 1, because 0 stands for a null array.
 func (e *encoder) compactArrayLength(n int) {
 	e.uvarint(uint32(n + 1))
+}
+
+// compactInt32Array encodes a COMPACT_ARRAY of INT32 values.
+func (e *encoder) compactInt32Array(values []int32) {
+	e.compactArrayLength(len(values))
+	for _, v := range values {
+		e.int32(v)
+	}
 }
 
 // emptyTaggedFields encodes a TAG_BUFFER that holds no tagged fields.

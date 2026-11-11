@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"reflect"
 	"testing"
@@ -251,6 +252,59 @@ func TestEncodeDescribeTopicPartitionsResponse(t *testing.T) {
 				"00", // TAG_BUFFER: empty
 		},
 		{
+			// The response body from the "List for a single partition" stage
+			// instructions.
+			name: "topic with one partition",
+			topics: []topicDescription{{
+				errorCode: 0,
+				name:      "foo",
+				id:        uuid{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6},
+				partitions: []partitionMetadata{
+					{index: 0, leader: 1, leaderEpoch: 0, replicas: []int32{1}, isr: []int32{1}},
+				},
+			}},
+			want: "00000000" + // throttle_time_ms: 0
+				"02" + // topics array: 1 element
+				"0000" + // error_code: 0 (no error)
+				"04" + // name length: 3 (compact string)
+				"666f6f" + // name: "foo"
+				"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" + // topic_id
+				"00" + // is_internal: false
+				"02" + // partitions array: 1 element
+				"0000" + // error_code: 0 (no error)
+				"00000000" + // partition_index: 0
+				"00000001" + // leader_id: 1
+				"00000000" + // leader_epoch: 0
+				"02" + "00000001" + // replica_nodes: broker 1
+				"02" + "00000001" + // isr_nodes: broker 1
+				"01" + // eligible_leader_replicas: 0 elements (empty)
+				"01" + // last_known_elr: 0 elements (empty)
+				"01" + // offline_replicas: 0 elements (empty)
+				"00" + // TAG_BUFFER: empty
+				"00000000" + // topic_authorized_operations: 0
+				"00" + // TAG_BUFFER: empty
+				"ff" + // next_cursor: -1 (null)
+				"00", // TAG_BUFFER: empty
+		},
+		{
+			name: "partitions with several replicas",
+			topics: []topicDescription{{
+				name: "t",
+				id:   testTopicID(1),
+				partitions: []partitionMetadata{
+					{index: 0, leader: 2, leaderEpoch: 7, replicas: []int32{2, 3, 1}, isr: []int32{2, 3}},
+					{index: 1, leader: -1, leaderEpoch: 8},
+				},
+			}},
+			want: "00000000 02" +
+				"0000 02 74 00000000000040008000000000000001 00" +
+				"03" +
+				"0000 00000000 00000002 00000007 04 00000002 00000003 00000001 03 00000002 00000003 01 01 01 00" +
+				"0000 00000001 ffffffff 00000008 01 01 01 01 01 00" +
+				"00000000 00" +
+				"ff 00",
+		},
+		{
 			name: "several topics",
 			topics: []topicDescription{
 				{errorCode: 3, name: "a"},
@@ -281,8 +335,12 @@ func TestEncodeDescribeTopicPartitionsResponse(t *testing.T) {
 				t.Fatalf("decoded %d topics, want %d", len(decoded.topics), len(tt.topics))
 			}
 			for i, topic := range tt.topics {
-				if decoded.topics[i].name != topic.name || decoded.topics[i].errorCode != topic.errorCode {
-					t.Errorf("decoded topics[%d] = %+v, want %+v", i, decoded.topics[i], topic)
+				got := decoded.topics[i]
+				if got.name != topic.name || got.errorCode != topic.errorCode || got.id != topic.id {
+					t.Errorf("decoded topics[%d] = %+v, want %+v", i, got, topic)
+				}
+				if len(got.partitions) != len(topic.partitions) {
+					t.Errorf("decoded topics[%d] has %d partitions, want %d", i, len(got.partitions), len(topic.partitions))
 				}
 			}
 		})
@@ -376,6 +434,202 @@ func TestDescribeUnknownTopic(t *testing.T) {
 
 			expectNoMoreData(t, conn)
 		})
+	}
+}
+
+// describeTopics sends a DescribeTopicPartitions request for the given topics
+// over a new connection to the broker at addr, and returns the decoded
+// response after checking its message_size, correlation ID and header.
+func describeTopics(t *testing.T, addr string, topicNames ...string) describeTopicPartitionsResponse {
+	t.Helper()
+
+	const correlationID = 1915044735
+
+	conn := dial(t, addr)
+	send(t, conn, newDescribeTopicPartitionsRequest(correlationID, topicNames...))
+
+	response := readResponse(t, conn)
+	if want := int32(4 + len(response.body)); response.messageSize != want {
+		t.Errorf("message_size = %d, want %d", response.messageSize, want)
+	}
+	if response.correlationID != correlationID {
+		t.Errorf("correlation_id = %d, want %d", response.correlationID, correlationID)
+	}
+
+	body := decodeDescribeTopicPartitionsResponse(t, response.bodyAfterHeaderV1(t))
+	if body.throttleTimeMs != 0 {
+		t.Errorf("throttle_time_ms = %d, want 0", body.throttleTimeMs)
+	}
+	if body.nextCursor != nil {
+		t.Errorf("next_cursor = %+v, want null", *body.nextCursor)
+	}
+
+	expectNoMoreData(t, conn)
+
+	return body
+}
+
+// expectKnownTopic checks that topic is how the broker describes an existing
+// topic with the given ID and partitions, each of which is led by broker 1,
+// its only replica (which is how the test fixtures create partitions).
+func expectKnownTopic(t *testing.T, topic describedTopic, name string, id uuid, partitions ...int32) {
+	t.Helper()
+
+	if topic.errorCode != 0 {
+		t.Errorf("topic %q: error_code = %d, want 0", name, topic.errorCode)
+	}
+	if topic.name != name {
+		t.Errorf("topic_name = %q, want %q", topic.name, name)
+	}
+	if topic.id != id {
+		t.Errorf("topic %q: topic_id = %v, want %v", name, topic.id, id)
+	}
+	if topic.isInternal {
+		t.Errorf("topic %q: is_internal = true, want false", name)
+	}
+
+	if len(topic.partitions) != len(partitions) {
+		t.Fatalf("topic %q: got %d partitions, want %d", name, len(topic.partitions), len(partitions))
+	}
+	for i, index := range partitions {
+		want := describedPartition{
+			errorCode:      0,
+			partitionIndex: index,
+			leaderID:       1,
+			leaderEpoch:    0,
+			replicaNodes:   []int32{1},
+			isrNodes:       []int32{1},
+		}
+		if got := topic.partitions[i]; !reflect.DeepEqual(got, want) {
+			t.Errorf("topic %q: partitions[%d] = %+v, want %+v", name, i, got, want)
+		}
+	}
+}
+
+// Stage ea7: a DescribeTopicPartitions request for a topic that exists with a
+// single partition is answered with the ID of the topic and its partition,
+// both read from the cluster metadata log.
+func TestDescribeTopicWithSinglePartition(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "bar", id: testTopicID(0x80), partitions: []int32{0}},
+		testTopic{name: "foo", id: testTopicID(0x81), partitions: []int32{0}},
+		testTopic{name: "paz", id: testTopicID(0x82), partitions: []int32{0, 1}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	t.Run("topic with a single partition", func(t *testing.T) {
+		body := describeTopics(t, addr, "foo")
+
+		if len(body.topics) != 1 {
+			t.Fatalf("got %d topics, want 1", len(body.topics))
+		}
+		expectKnownTopic(t, body.topics[0], "foo", testTopicID(0x81), 0)
+	})
+
+	t.Run("another topic of the same log", func(t *testing.T) {
+		body := describeTopics(t, addr, "bar")
+
+		if len(body.topics) != 1 {
+			t.Fatalf("got %d topics, want 1", len(body.topics))
+		}
+		expectKnownTopic(t, body.topics[0], "bar", testTopicID(0x80), 0)
+	})
+
+	t.Run("response bytes", func(t *testing.T) {
+		conn := dial(t, addr)
+		send(t, conn, newDescribeTopicPartitionsRequest(7, "foo"))
+
+		// The response from the stage instructions, with the topic ID of
+		// the cluster metadata log. (The instructions announce 74 bytes, but
+		// the header and body they show add up to 69.)
+		want := "00000045" + // message_size: 69 bytes
+			"00000007" + // correlation_id
+			"00" + // TAG_BUFFER: empty (response header v1)
+			"00000000" + // throttle_time_ms: 0
+			"02" + // topics array: 1 element
+			"0000" + // error_code: 0 (no error)
+			"04666f6f" + // name: "foo"
+			"00000000000040008000000000000081" + // topic_id
+			"00" + // is_internal: false
+			"02" + // partitions array: 1 element
+			"0000" + // error_code: 0 (no error)
+			"00000000" + // partition_index: 0
+			"00000001" + // leader_id: 1
+			"00000000" + // leader_epoch: 0
+			"0200000001" + // replica_nodes: broker 1
+			"0200000001" + // isr_nodes: broker 1
+			"01" + // eligible_leader_replicas: empty
+			"01" + // last_known_elr: empty
+			"01" + // offline_replicas: empty
+			"00" + // TAG_BUFFER: empty
+			"00000000" + // topic_authorized_operations: 0
+			"00" + // TAG_BUFFER: empty
+			"ff" + // next_cursor: -1 (null)
+			"00" // TAG_BUFFER: empty
+
+		got := make([]byte, len(want)/2)
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("failed to read response: %v", err)
+		}
+		if !bytes.Equal(got, mustDecodeHex(t, want)) {
+			t.Errorf("response = % x, want % x", got, mustDecodeHex(t, want))
+		}
+
+		expectNoMoreData(t, conn)
+	})
+
+	t.Run("unknown topic next to existing ones", func(t *testing.T) {
+		body := describeTopics(t, addr, "unknown")
+
+		if len(body.topics) != 1 {
+			t.Fatalf("got %d topics, want 1", len(body.topics))
+		}
+		expectUnknownTopic(t, body.topics[0], "unknown")
+	})
+
+	t.Run("topic names are case-sensitive", func(t *testing.T) {
+		body := describeTopics(t, addr, "FOO")
+
+		if len(body.topics) != 1 {
+			t.Fatalf("got %d topics, want 1", len(body.topics))
+		}
+		expectUnknownTopic(t, body.topics[0], "FOO")
+	})
+}
+
+// The cluster metadata log of the CodeCrafters tester, as documented in the
+// protocol inspector linked from the stage instructions.
+func TestDescribeTopicOfCodeCraftersLog(t *testing.T) {
+	logDir := t.TempDir()
+	writeLogSegment(t, logDir, "__cluster_metadata", 0, mustDecodeHex(t, featureLevelBatchHex+sazTopicBatchHex))
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := describeTopics(t, addr, "saz")
+
+	if len(body.topics) != 1 {
+		t.Fatalf("got %d topics, want 1", len(body.topics))
+	}
+	expectKnownTopic(t, body.topics[0], "saz", sazTopicID, 1)
+}
+
+// A cluster metadata log that can't be read is not mistaken for a cluster
+// without topics: the request fails, and the connection is closed.
+func TestDescribeTopicWithCorruptMetadataLog(t *testing.T) {
+	logDir := t.TempDir()
+	writeLogSegment(t, logDir, "__cluster_metadata", 0, mustDecodeHex(t, sazTopicBatchHex)[:100])
+	addr := startTestServerWithLogDir(t, logDir)
+
+	conn := dial(t, addr)
+	send(t, conn, newDescribeTopicPartitionsRequest(1, "saz"))
+
+	response := make([]byte, 64)
+	n, err := conn.Read(response)
+	if n > 0 {
+		t.Fatalf("expected no response, got % x", response[:n])
+	}
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected the connection to be closed, got error: %v", err)
 	}
 }
 

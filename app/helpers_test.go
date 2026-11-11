@@ -16,9 +16,19 @@ import (
 // server makes them fail instead of hang.
 const testTimeout = 2 * time.Second
 
-// startTestServer runs the broker on an ephemeral local port and returns the
-// address it listens on. The listener is closed when the test finishes.
+// startTestServer runs a broker without any topics on an ephemeral local port
+// and returns the address it listens on. The broker is stopped when the test
+// finishes.
 func startTestServer(t *testing.T) string {
+	t.Helper()
+
+	return startTestServerWithLogDir(t, t.TempDir())
+}
+
+// startTestServerWithLogDir runs a broker that keeps its logs in logDir on an
+// ephemeral local port and returns the address it listens on. The broker is
+// stopped when the test finishes.
+func startTestServerWithLogDir(t *testing.T, logDir string) string {
 	t.Helper()
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -27,7 +37,8 @@ func startTestServer(t *testing.T) string {
 	}
 	t.Cleanup(func() { l.Close() })
 
-	go serve(l)
+	b := &broker{logDir: logDir}
+	go b.serve(l)
 
 	return l.Addr().String()
 }
