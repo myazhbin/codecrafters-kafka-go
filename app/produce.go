@@ -132,15 +132,21 @@ func (b *broker) handleProduce(d *decoder) ([]byte, error) {
 		return nil, fmt.Errorf("parsing Produce request: %w", err)
 	}
 
-	// The broker can't store records yet: all the partitions are reported as
-	// unknown.
+	metadata, err := loadClusterMetadata(b.logDir)
+	if err != nil {
+		return nil, err
+	}
+
 	failed := false
 	topics := make([]produceTopicResponse, 0, len(request.topics))
 	for _, topic := range request.topics {
 		response := produceTopicResponse{name: topic.name}
 		for _, partition := range topic.partitions {
-			response.partitions = append(response.partitions, produceError(partition.index, errorCodeUnknownTopicOrPartition))
-			failed = true
+			partitionResponse := produceToPartition(metadata, topic.name, partition)
+			if partitionResponse.errorCode != errorCodeNone {
+				failed = true
+			}
+			response.partitions = append(response.partitions, partitionResponse)
 		}
 		topics = append(topics, response)
 	}
@@ -153,4 +159,17 @@ func (b *broker) handleProduce(d *decoder) ([]byte, error) {
 	}
 
 	return encodeProduceResponse(topics), nil
+}
+
+// produceToPartition answers the part of a Produce request that is about one
+// partition of the topic with the given name.
+func produceToPartition(metadata *clusterMetadata, topicName string, partition producePartition) producePartitionResponse {
+	topic, ok := metadata.topicsByName[topicName]
+	if !ok || !topic.hasPartition(partition.index) {
+		return produceError(partition.index, errorCodeUnknownTopicOrPartition)
+	}
+
+	// The broker doesn't store records yet: it answers as if the records of
+	// the request were the first ones of the partition, at the offset 0.
+	return producePartitionResponse{index: partition.index}
 }

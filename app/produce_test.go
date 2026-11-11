@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"reflect"
 	"testing"
@@ -347,6 +348,27 @@ func TestEncodeProduceResponse(t *testing.T) {
 				"00", // tag buffer
 		},
 		{
+			name: "records added to a partition",
+			topics: []produceTopicResponse{{
+				name:       "foo",
+				partitions: []producePartitionResponse{{index: 2, baseOffset: 5, logStartOffset: 1}},
+			}},
+			want: "02" + // responses: 1 element
+				"04 666f6f" + // name: "foo"
+				"02" + // partition_responses: 1 element
+				"00000002" + // index: 2
+				"0000" + // error_code: 0
+				"0000000000000005" + // base_offset: 5
+				"ffffffffffffffff" + // log_append_time_ms: -1
+				"0000000000000001" + // log_start_offset: 1
+				"01" + // record_errors: empty
+				"00" + // error_message: null
+				"00" + // tag buffer
+				"00" + // tag buffer
+				"00000000" + // throttle_time_ms: 0
+				"00", // tag buffer
+		},
+		{
 			name: "several topics and partitions",
 			topics: []produceTopicResponse{
 				{name: "foo", partitions: []producePartitionResponse{produceError(0, 3), produceError(7, 3)}},
@@ -453,6 +475,164 @@ func TestProduceToInvalidTopicOrPartition(t *testing.T) {
 	expectNoMoreData(t, conn)
 }
 
+// Stage gg1: a Produce request for a topic and a partition that exist is
+// answered without an error.
+func TestProduceToValidTopicAndPartition(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "bar", id: testTopicID(1), partitions: []int32{0}},
+		testTopic{name: "foo", id: testTopicID(2), partitions: []int32{0, 1}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	records := encodeRecordBatch(testBatch{values: [][]byte{[]byte("Hello World!")}})
+
+	for _, tt := range []struct {
+		topic     string
+		partition int32
+	}{
+		{topic: "foo", partition: 0},
+		{topic: "foo", partition: 1},
+		{topic: "bar", partition: 0},
+	} {
+		t.Run(fmt.Sprintf("%s-%d", tt.topic, tt.partition), func(t *testing.T) {
+			body := produce(t, addr, produceTopic{
+				name:       tt.topic,
+				partitions: []producePartition{{index: tt.partition, records: records}},
+			})
+
+			// The topics field has 1 element, whose name matches the topic
+			// name in the request.
+			if len(body.topics) != 1 {
+				t.Fatalf("topics has %d elements, want 1", len(body.topics))
+			}
+			topic := body.topics[0]
+			if topic.name != tt.topic {
+				t.Errorf("name = %q, want %q", topic.name, tt.topic)
+			}
+
+			// The partitions field has 1 element.
+			if len(topic.partitions) != 1 {
+				t.Fatalf("partitions has %d elements, want 1", len(topic.partitions))
+			}
+			want := producedPartition{
+				// The index matches the partition in the request.
+				index: tt.partition,
+				// The error_code is 0 (NO_ERROR).
+				errorCode: 0,
+				// The base_offset is 0: this is the first record of the
+				// partition.
+				baseOffset: 0,
+				// The log_append_time_ms is -1.
+				logAppendTimeMs: -1,
+				// The log_start_offset is 0.
+				logStartOffset: 0,
+			}
+			if got := topic.partitions[0]; !reflect.DeepEqual(got, want) {
+				t.Errorf("partition response = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// Each partition of a Produce request gets its own answer: some may be valid
+// while others are not.
+func TestProduceToValidAndInvalidPartitions(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0, 1}},
+		testTopic{name: "empty", id: testTopicID(2)},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	records := encodeRecordBatch(testBatch{values: [][]byte{[]byte("Hello World!")}})
+
+	body := produce(t, addr,
+		produceTopic{name: "foo", partitions: []producePartition{
+			{index: 1, records: records},
+			{index: 2, records: records},
+			{index: 0, records: records},
+			{index: -1, records: records},
+		}},
+		produceTopic{name: "nope", partitions: []producePartition{{index: 0, records: records}}},
+		produceTopic{name: "empty", partitions: []producePartition{{index: 0, records: records}}},
+		// Topic names are case-sensitive.
+		produceTopic{name: "FOO", partitions: []producePartition{{index: 0, records: records}}},
+	)
+
+	type partitionResult struct {
+		index     int32
+		errorCode int16
+	}
+	want := []struct {
+		name       string
+		partitions []partitionResult
+	}{
+		{name: "foo", partitions: []partitionResult{{1, 0}, {2, 3}, {0, 0}, {-1, 3}}},
+		{name: "nope", partitions: []partitionResult{{0, 3}}},
+		{name: "empty", partitions: []partitionResult{{0, 3}}},
+		{name: "FOO", partitions: []partitionResult{{0, 3}}},
+	}
+
+	if len(body.topics) != len(want) {
+		t.Fatalf("topics has %d elements, want %d", len(body.topics), len(want))
+	}
+	for i, wantTopic := range want {
+		got := body.topics[i]
+		if got.name != wantTopic.name {
+			t.Errorf("topics[%d]: name = %q, want %q", i, got.name, wantTopic.name)
+		}
+		if len(got.partitions) != len(wantTopic.partitions) {
+			t.Fatalf("topics[%d]: partitions has %d elements, want %d", i, len(got.partitions), len(wantTopic.partitions))
+		}
+		for j, wantPartition := range wantTopic.partitions {
+			if wantPartition.errorCode != 0 {
+				expectProduceError(t, got.partitions[j], wantPartition.index, wantPartition.errorCode)
+				continue
+			}
+
+			wantSuccess := producedPartition{index: wantPartition.index, logAppendTimeMs: -1}
+			if !reflect.DeepEqual(got.partitions[j], wantSuccess) {
+				t.Errorf("topics[%d].partitions[%d] = %+v, want %+v", i, j, got.partitions[j], wantSuccess)
+			}
+		}
+	}
+}
+
+// A producer that asks for no acknowledgement (acks=0) doesn't read
+// responses, so the broker doesn't send any: the next response on the
+// connection is the one to the next request.
+func TestProduceWithoutAcknowledgement(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir, testTopic{name: "foo", id: testTopicID(1), partitions: []int32{0}})
+	addr := startTestServerWithLogDir(t, logDir)
+
+	conn := dial(t, addr)
+
+	send(t, conn, newProduceRequestWithAcks(1, 0, produceTopic{
+		name:       "foo",
+		partitions: []producePartition{{index: 0, records: encodeRecordBatch(testBatch{values: [][]byte{[]byte("fire and forget")}})}},
+	}))
+
+	send(t, conn, newApiVersionsRequest(2))
+	expectApiVersionsResponse(t, conn, 2)
+
+	expectNoMoreData(t, conn)
+}
+
+// A cluster metadata log that can't be read is not mistaken for a cluster
+// without topics: the request fails, and the connection is closed.
+func TestProduceWithCorruptMetadataLog(t *testing.T) {
+	logDir := t.TempDir()
+	writeLogSegment(t, logDir, "__cluster_metadata", 0, mustDecodeHex(t, sazTopicBatchHex)[:100])
+	addr := startTestServerWithLogDir(t, logDir)
+
+	conn := dial(t, addr)
+	send(t, conn, newProduceRequest(1, produceTopic{name: "saz", partitions: []producePartition{{index: 1}}}))
+
+	expectConnectionClosed(t, conn)
+}
+
 // The response to a Produce request has the topics and partitions of the
 // request, in the same order.
 func TestProduceResponseMirrorsRequest(t *testing.T) {
@@ -481,9 +661,8 @@ func TestProduceResponseMirrorsRequest(t *testing.T) {
 	}
 }
 
-// A producer that asks for no acknowledgement (acks=0) doesn't read
-// responses, so the broker doesn't send any. The only way to tell such a
-// producer that its request failed is to close the connection.
+// The only way to tell a producer that asks for no acknowledgement that its
+// request failed is to close the connection.
 func TestProduceWithoutAcknowledgementFails(t *testing.T) {
 	addr := startTestServer(t)
 	conn := dial(t, addr)
