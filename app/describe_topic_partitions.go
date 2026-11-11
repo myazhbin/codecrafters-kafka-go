@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // describeTopicPartitionsRequest is the body of a DescribeTopicPartitions
 // request (v0).
@@ -110,8 +113,14 @@ func (b *broker) handleDescribeTopicPartitions(d *decoder) ([]byte, error) {
 		return nil, err
 	}
 
-	topics := make([]topicDescription, 0, len(request.topicNames))
-	for _, name := range request.topicNames {
+	// Like Kafka, the broker describes the requested topics in alphabetical
+	// order, and each of them only once.
+	names := slices.Clone(request.topicNames)
+	slices.Sort(names)
+	names = slices.Compact(names)
+
+	topics := make([]topicDescription, 0, len(names))
+	for _, name := range names {
 		topic, ok := metadata.topicsByName[name]
 		if !ok {
 			topics = append(topics, topicDescription{

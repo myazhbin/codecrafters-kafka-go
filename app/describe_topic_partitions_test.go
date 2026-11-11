@@ -692,6 +692,118 @@ func TestDescribeTopicWithMultiplePartitions(t *testing.T) {
 	})
 }
 
+// Stage wq2: a request for several topics is answered with an entry for each
+// of them, sorted alphabetically by topic name.
+func TestDescribeMultipleTopics(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "zebra", id: testTopicID(0x01), partitions: []int32{0, 1}},
+		testTopic{name: "apple", id: testTopicID(0x02), partitions: []int32{0}},
+		testTopic{name: "mango", id: testTopicID(0x03), partitions: []int32{0, 1}},
+		testTopic{name: "Zebra", id: testTopicID(0x04), partitions: []int32{0}},
+		testTopic{name: "apple-2", id: testTopicID(0x05), partitions: []int32{0}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	// expected describes a topic of the response: a nil ID stands for a topic
+	// that the broker doesn't know.
+	type expected struct {
+		name       string
+		id         *uuid
+		partitions []int32
+	}
+	known := func(name string, id byte, partitions ...int32) expected {
+		topicID := testTopicID(id)
+		return expected{name: name, id: &topicID, partitions: partitions}
+	}
+	unknown := func(name string) expected {
+		return expected{name: name}
+	}
+
+	tests := []struct {
+		name    string
+		request []string
+		want    []expected
+	}{
+		{
+			name:    "example from the stage instructions",
+			request: []string{"zebra", "apple"},
+			want:    []expected{known("apple", 0x02, 0), known("zebra", 0x01, 0, 1)},
+		},
+		{
+			name:    "already sorted",
+			request: []string{"apple", "zebra"},
+			want:    []expected{known("apple", 0x02, 0), known("zebra", 0x01, 0, 1)},
+		},
+		{
+			name:    "three topics",
+			request: []string{"zebra", "mango", "apple"},
+			want:    []expected{known("apple", 0x02, 0), known("mango", 0x03, 0, 1), known("zebra", 0x01, 0, 1)},
+		},
+		{
+			name:    "single topic",
+			request: []string{"mango"},
+			want:    []expected{known("mango", 0x03, 0, 1)},
+		},
+		{
+			name:    "uppercase letters sort before lowercase ones",
+			request: []string{"zebra", "apple", "Zebra"},
+			want:    []expected{known("Zebra", 0x04, 0), known("apple", 0x02, 0), known("zebra", 0x01, 0, 1)},
+		},
+		{
+			name:    "a name sorts before the names it is a prefix of",
+			request: []string{"apple-2", "apple"},
+			want:    []expected{known("apple", 0x02, 0), known("apple-2", 0x05, 0)},
+		},
+		{
+			name:    "unknown topics are sorted along with the known ones",
+			request: []string{"zebra", "nope", "apple", "aaa"},
+			want:    []expected{unknown("aaa"), known("apple", 0x02, 0), unknown("nope"), known("zebra", 0x01, 0, 1)},
+		},
+		{
+			name:    "only unknown topics",
+			request: []string{"y", "x"},
+			want:    []expected{unknown("x"), unknown("y")},
+		},
+		{
+			name:    "a topic requested several times is described once",
+			request: []string{"zebra", "apple", "zebra", "apple", "zebra"},
+			want:    []expected{known("apple", 0x02, 0), known("zebra", 0x01, 0, 1)},
+		},
+		{
+			name:    "no topics",
+			request: nil,
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := describeTopics(t, addr, tt.request...)
+
+			var names []string
+			for _, topic := range body.topics {
+				names = append(names, topic.name)
+			}
+			var wantNames []string
+			for _, topic := range tt.want {
+				wantNames = append(wantNames, topic.name)
+			}
+			if !reflect.DeepEqual(names, wantNames) {
+				t.Fatalf("topics = %q, want %q", names, wantNames)
+			}
+
+			for i, want := range tt.want {
+				if want.id == nil {
+					expectUnknownTopic(t, body.topics[i], want.name)
+				} else {
+					expectKnownTopic(t, body.topics[i], want.name, *want.id, want.partitions...)
+				}
+			}
+		})
+	}
+}
+
 // The cluster metadata log of the CodeCrafters tester, as documented in the
 // protocol inspector linked from the stage instructions.
 func TestDescribeTopicOfCodeCraftersLog(t *testing.T) {
