@@ -76,6 +76,22 @@ type fetchTopicResponse struct {
 type fetchPartitionResponse struct {
 	index     int32
 	errorCode int16
+
+	// highWatermark is the offset that follows the last record of the
+	// partition that consumers may read, and logStartOffset the offset of
+	// its first record. Both are -1 when the fetch failed.
+	highWatermark  int64
+	logStartOffset int64
+}
+
+// fetchError returns the response for a partition that can't be fetched from.
+func fetchError(index int32, errorCode int16) fetchPartitionResponse {
+	return fetchPartitionResponse{
+		index:          index,
+		errorCode:      errorCode,
+		highWatermark:  -1,
+		logStartOffset: -1,
+	}
 }
 
 // encodeFetchResponse encodes the body of a Fetch response (v16).
@@ -93,9 +109,11 @@ func encodeFetchResponse(topics []fetchTopicResponse) []byte {
 		for _, partition := range topic.partitions {
 			e.int32(partition.index)
 			e.int16(partition.errorCode)
-			e.int64(-1)             // high_watermark: unknown
-			e.int64(-1)             // last_stable_offset: unknown
-			e.int64(-1)             // log_start_offset: unknown
+			e.int64(partition.highWatermark)
+			// Without transactions, all the records below the high watermark
+			// are stable.
+			e.int64(partition.highWatermark) // last_stable_offset
+			e.int64(partition.logStartOffset)
 			e.compactArrayLength(0) // aborted_transactions
 			e.int32(-1)             // preferred_read_replica: none
 			e.compactBytes(nil)     // records
@@ -116,19 +134,35 @@ func (b *broker) handleFetch(d *decoder) ([]byte, error) {
 		return nil, fmt.Errorf("parsing Fetch request: %w", err)
 	}
 
-	// The broker can't serve the records of any topic yet: all the requested
-	// partitions are reported as belonging to an unknown topic.
+	metadata, err := loadClusterMetadata(b.logDir)
+	if err != nil {
+		return nil, err
+	}
+
 	topics := make([]fetchTopicResponse, 0, len(request.topics))
 	for _, topic := range request.topics {
 		response := fetchTopicResponse{topicID: topic.topicID}
 		for _, partition := range topic.partitions {
-			response.partitions = append(response.partitions, fetchPartitionResponse{
-				index:     partition.index,
-				errorCode: errorCodeUnknownTopicID,
-			})
+			response.partitions = append(response.partitions, fetchFromPartition(metadata, topic.topicID, partition))
 		}
 		topics = append(topics, response)
 	}
 
 	return encodeFetchResponse(topics), nil
+}
+
+// fetchFromPartition answers the part of a Fetch request that is about one
+// partition of the topic with the given ID.
+func fetchFromPartition(metadata *clusterMetadata, topicID uuid, partition fetchPartition) fetchPartitionResponse {
+	topic, ok := metadata.topicsByID[topicID]
+	if !ok {
+		return fetchError(partition.index, errorCodeUnknownTopicID)
+	}
+	if !topic.hasPartition(partition.index) {
+		return fetchError(partition.index, errorCodeUnknownTopicOrPartition)
+	}
+
+	// The broker can't read the records of partitions yet: they all look
+	// empty, with the offset 0 as their start and end.
+	return fetchPartitionResponse{index: partition.index}
 }

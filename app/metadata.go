@@ -145,12 +145,25 @@ func (m *clusterMetadata) replay(value []byte) error {
 	return nil
 }
 
+// findPartition returns the position at which the partition with the given
+// index is, or would have to be inserted, in the partitions of the topic, and
+// whether the topic has that partition.
+func (t *topicMetadata) findPartition(index int32) (int, bool) {
+	return slices.BinarySearchFunc(t.partitions, index, func(p partitionMetadata, index int32) int {
+		return cmp.Compare(p.index, index)
+	})
+}
+
+// hasPartition reports whether the topic has a partition with the given index.
+func (t *topicMetadata) hasPartition(index int32) bool {
+	_, found := t.findPartition(index)
+	return found
+}
+
 // setPartition adds a partition to the topic, or replaces the partition that
 // has the same index.
 func (t *topicMetadata) setPartition(partition partitionMetadata) {
-	i, found := slices.BinarySearchFunc(t.partitions, partition.index, func(p partitionMetadata, index int32) int {
-		return cmp.Compare(p.index, index)
-	})
+	i, found := t.findPartition(partition.index)
 	if found {
 		t.partitions[i] = partition
 	} else {

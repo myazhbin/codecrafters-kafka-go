@@ -282,6 +282,26 @@ func TestClusterMetadataReplay(t *testing.T) {
 		}
 	})
 
+	t.Run("hasPartition", func(t *testing.T) {
+		metadata := newClusterMetadata()
+		mustReplay(t, metadata, topicRecord("foo", testTopicID(1)))
+		mustReplay(t, metadata, topicRecord("bar", testTopicID(2)))
+		for _, index := range []int32{4, 0, 2} {
+			mustReplay(t, metadata, partitionRecord(testPartition{index: index, topicID: testTopicID(1), leader: 1}))
+		}
+
+		foo := metadata.topicsByName["foo"]
+		for index, want := range map[int32]bool{-1: false, 0: true, 1: false, 2: true, 3: false, 4: true, 5: false} {
+			if got := foo.hasPartition(index); got != want {
+				t.Errorf("foo.hasPartition(%d) = %v, want %v", index, got, want)
+			}
+		}
+
+		if metadata.topicsByName["bar"].hasPartition(0) {
+			t.Error("bar.hasPartition(0) = true, want false for a topic without partitions")
+		}
+	})
+
 	t.Run("later partition record replaces the earlier one", func(t *testing.T) {
 		metadata := newClusterMetadata()
 		mustReplay(t, metadata, topicRecord("foo", testTopicID(1)))

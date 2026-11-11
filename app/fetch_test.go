@@ -347,7 +347,7 @@ func TestEncodeFetchResponse(t *testing.T) {
 			name: "unknown topic",
 			topics: []fetchTopicResponse{{
 				topicID:    sazTopicID,
-				partitions: []fetchPartitionResponse{{index: 0, errorCode: 100}},
+				partitions: []fetchPartitionResponse{fetchError(0, 100)},
 			}},
 			want: "00000000" + // throttle_time_ms: 0
 				"0000" + // error_code: 0
@@ -368,13 +368,37 @@ func TestEncodeFetchResponse(t *testing.T) {
 				"00", // tag buffer
 		},
 		{
+			name: "empty partition",
+			topics: []fetchTopicResponse{{
+				topicID:    sazTopicID,
+				partitions: []fetchPartitionResponse{{index: 0}},
+			}},
+			want: "00000000" + // throttle_time_ms: 0
+				"0000" + // error_code: 0
+				"00000000" + // session_id: 0
+				"02" + // responses: 1 element
+				"00000000000040008000000000000091" + // topic_id
+				"02" + // partitions: 1 element
+				"00000000" + // partition_index: 0
+				"0000" + // error_code: 0
+				"0000000000000000" + // high_watermark: 0
+				"0000000000000000" + // last_stable_offset: 0
+				"0000000000000000" + // log_start_offset: 0
+				"01" + // aborted_transactions: empty
+				"ffffffff" + // preferred_read_replica: -1
+				"01" + // records: empty
+				"00" + // tag buffer
+				"00" + // tag buffer
+				"00", // tag buffer
+		},
+		{
 			name: "several topics and partitions",
 			topics: []fetchTopicResponse{
 				{
 					topicID: testTopicID(1),
 					partitions: []fetchPartitionResponse{
-						{index: 0, errorCode: 100},
-						{index: 5, errorCode: 100},
+						fetchError(0, 100),
+						fetchError(5, 100),
 					},
 				},
 				{topicID: testTopicID(2)},
@@ -550,6 +574,165 @@ func TestFetchUnknownTopic(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Stage cm4: a Fetch request for a topic that exists but has no messages is
+// answered without an error and without records.
+func TestFetchEmptyTopic(t *testing.T) {
+	topicID := testTopicID(0x51)
+
+	// The log of a partition without messages may be an empty file, or not
+	// exist at all.
+	logSetups := map[string]func(t *testing.T, logDir string){
+		"empty log file": func(t *testing.T, logDir string) {
+			writeLogSegment(t, logDir, "empty", 0, nil)
+		},
+		"no log file": func(t *testing.T, logDir string) {},
+	}
+
+	for name, setUpLog := range logSetups {
+		t.Run(name, func(t *testing.T) {
+			logDir := t.TempDir()
+			writeClusterMetadataLog(t, logDir,
+				testTopic{name: "other", id: testTopicID(0x50), partitions: []int32{0}},
+				testTopic{name: "empty", id: topicID, partitions: []int32{0}},
+			)
+			setUpLog(t, logDir)
+			addr := startTestServerWithLogDir(t, logDir)
+
+			body := fetch(t, addr, fetchTopic{topicID: topicID, partitions: []fetchPartition{{index: 0}}})
+
+			// The error code of the response is 0 (No Error), its
+			// throttle_time_ms is 0.
+			if body.errorCode != 0 {
+				t.Errorf("error_code = %d, want 0", body.errorCode)
+			}
+			if body.throttleTimeMs != 0 {
+				t.Errorf("throttle_time_ms = %d, want 0", body.throttleTimeMs)
+			}
+
+			// The responses field has 1 element, whose topic_id matches what
+			// was sent in the request.
+			if len(body.topics) != 1 {
+				t.Fatalf("responses has %d elements, want 1", len(body.topics))
+			}
+			topic := body.topics[0]
+			if topic.topicID != topicID {
+				t.Errorf("topic_id = %v, want %v", topic.topicID, topicID)
+			}
+
+			// The partitions array has 1 element, whose partition_index is 0,
+			// whose error_code is 0 (No Error) and that has no records.
+			if len(topic.partitions) != 1 {
+				t.Fatalf("partitions has %d elements, want 1", len(topic.partitions))
+			}
+			partition := topic.partitions[0]
+			if partition.index != 0 {
+				t.Errorf("partition_index = %d, want 0", partition.index)
+			}
+			if partition.errorCode != 0 {
+				t.Errorf("error_code = %d, want 0", partition.errorCode)
+			}
+			if len(partition.records) != 0 {
+				t.Errorf("got %d bytes of records, want none: % x", len(partition.records), partition.records)
+			}
+
+			// An empty partition starts and ends at the offset 0.
+			if partition.highWatermark != 0 || partition.lastStableOffset != 0 || partition.logStartOffset != 0 {
+				t.Errorf("high_watermark = %d, last_stable_offset = %d, log_start_offset = %d; want 0, 0, 0",
+					partition.highWatermark, partition.lastStableOffset, partition.logStartOffset)
+			}
+		})
+	}
+}
+
+// A Fetch request may name partitions that exist next to ones that don't:
+// each of them gets its own answer.
+func TestFetchKnownAndUnknownPartitions(t *testing.T) {
+	logDir := t.TempDir()
+	writeClusterMetadataLog(t, logDir,
+		testTopic{name: "one", id: testTopicID(1), partitions: []int32{0}},
+		testTopic{name: "two", id: testTopicID(2), partitions: []int32{0, 1}},
+	)
+	addr := startTestServerWithLogDir(t, logDir)
+
+	body := fetch(t, addr,
+		fetchTopic{topicID: testTopicID(2), partitions: []fetchPartition{{index: 1}, {index: 2}, {index: 0}}},
+		fetchTopic{topicID: testTopicID(9), partitions: []fetchPartition{{index: 0}}},
+		fetchTopic{topicID: testTopicID(1), partitions: []fetchPartition{{index: 0}, {index: -1}}},
+	)
+
+	if body.errorCode != 0 {
+		t.Errorf("error_code = %d, want 0", body.errorCode)
+	}
+
+	type partitionResult struct {
+		index     int32
+		errorCode int16
+	}
+	want := []struct {
+		topicID    uuid
+		partitions []partitionResult
+	}{
+		{
+			topicID: testTopicID(2),
+			// The topic exists, but it has no partition 2:
+			// UNKNOWN_TOPIC_OR_PARTITION (3).
+			partitions: []partitionResult{{index: 1, errorCode: 0}, {index: 2, errorCode: 3}, {index: 0, errorCode: 0}},
+		},
+		{
+			topicID: testTopicID(9),
+			// The topic doesn't exist: UNKNOWN_TOPIC_ID (100).
+			partitions: []partitionResult{{index: 0, errorCode: 100}},
+		},
+		{
+			topicID:    testTopicID(1),
+			partitions: []partitionResult{{index: 0, errorCode: 0}, {index: -1, errorCode: 3}},
+		},
+	}
+
+	if len(body.topics) != len(want) {
+		t.Fatalf("responses has %d elements, want %d", len(body.topics), len(want))
+	}
+	for i, wantTopic := range want {
+		got := body.topics[i]
+		if got.topicID != wantTopic.topicID {
+			t.Errorf("responses[%d]: topic_id = %v, want %v", i, got.topicID, wantTopic.topicID)
+		}
+		if len(got.partitions) != len(wantTopic.partitions) {
+			t.Fatalf("responses[%d]: partitions has %d elements, want %d", i, len(got.partitions), len(wantTopic.partitions))
+		}
+		for j, wantPartition := range wantTopic.partitions {
+			partition := got.partitions[j]
+			if partition.index != wantPartition.index || partition.errorCode != wantPartition.errorCode {
+				t.Errorf("responses[%d].partitions[%d] = {index: %d, error_code: %d}, want %+v",
+					i, j, partition.index, partition.errorCode, wantPartition)
+			}
+
+			// Failed fetches have no offsets to report.
+			wantOffset := int64(0)
+			if wantPartition.errorCode != 0 {
+				wantOffset = -1
+			}
+			if partition.highWatermark != wantOffset || partition.logStartOffset != wantOffset {
+				t.Errorf("responses[%d].partitions[%d]: high_watermark = %d, log_start_offset = %d; want %d for both",
+					i, j, partition.highWatermark, partition.logStartOffset, wantOffset)
+			}
+		}
+	}
+}
+
+// A cluster metadata log that can't be read is not mistaken for a cluster
+// without topics: the request fails, and the connection is closed.
+func TestFetchWithCorruptMetadataLog(t *testing.T) {
+	logDir := t.TempDir()
+	writeLogSegment(t, logDir, "__cluster_metadata", 0, mustDecodeHex(t, sazTopicBatchHex)[:100])
+	addr := startTestServerWithLogDir(t, logDir)
+
+	conn := dial(t, addr)
+	send(t, conn, newFetchRequest(1, fetchTopic{topicID: sazTopicID, partitions: []fetchPartition{{index: 1}}}))
+
+	expectConnectionClosed(t, conn)
 }
 
 // expectFetchError checks that partition is how the broker answers a fetch
